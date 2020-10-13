@@ -22,8 +22,11 @@
 #include "qapi/qapi-events-block-export.h"
 #include "qemu/id.h"
 
+extern const BlockExportDriver blk_exp_vduse_blk;
+
 static const BlockExportDriver *blk_exp_drivers[] = {
     &blk_exp_nbd,
+    &blk_exp_vduse_blk,
 };
 
 /* Only accessed from the main thread */

@@ -85,6 +85,21 @@
             '*bitmap': 'str' } }
 
 ##
+# @BlockExportOptionsVduseBlk:
+#
+# A vduse-blk block export.
+#
+# @name: the name of vduse device
+# @num-queues: the number of virtqueues
+# @queue-size: the size of virtqueue
+#
+# Since: 5.2
+##
+{ 'struct': 'BlockExportOptionsVduseBlk',
+  'data': { '*name': 'str', '*num-queues': 'uint16',
+            '*queue-size': 'uint16'} }
+
+##
 # @NbdServerAddOptions:
 #
 # An NBD block export.
@@ -184,7 +199,7 @@
 # Since: 4.2
 ##
 { 'enum': 'BlockExportType',
-  'data': [ 'nbd' ] }
+  'data': [ 'nbd', 'vduse-blk' ] }
 
 ##
 # @BlockExportOptions:
@@ -213,7 +228,8 @@
             '*writethrough': 'bool' },
   'discriminator': 'type',
   'data': {
-      'nbd': 'BlockExportOptionsNbd'
+      'nbd': 'BlockExportOptionsNbd',
+      'vduse-blk': 'BlockExportOptionsVduseBlk'
    } }
 
 ##
