@@ -19,6 +19,7 @@
 #define VDUSE_VQ_ALIGN 4096
 #define VDUSE_BOUNCE_SIZE (64 * 1024 * 1024)
 
+#define VDUSE_MAX_QUEUE_SIZE 1024
 #define MAX_IOVA_REGIONS 256
 
 typedef struct VduseDev VduseDev;
@@ -26,6 +27,26 @@ typedef struct VduseDev VduseDev;
 typedef struct VduseVirtq VduseVirtq;
 
 typedef void (*VduseVQHandler)(VduseDev *dev, VduseVirtq *vq);
+
+typedef struct VduseDescStateSplit {
+    uint8_t inflight;
+    uint8_t padding[5];
+    uint16_t next;
+    uint64_t counter;
+} VduseDescStateSplit;
+
+typedef struct VduseVirtqLogInflight {
+    uint64_t features;
+    uint16_t version;
+    uint16_t desc_num;
+    uint16_t last_batch_head;
+    uint16_t used_idx;
+    VduseDescStateSplit desc[];
+} VduseVirtqLogInflight;
+
+typedef struct VduseVirtqLog {
+    VduseVirtqLogInflight inflight;
+} VduseVirtqLog;
 
 typedef struct VduseRing {
     unsigned int num;
@@ -36,6 +57,11 @@ typedef struct VduseRing {
     struct vring_avail *avail;
     struct vring_used *used;
 } VduseRing;
+
+typedef struct VduseVirtqInflightDesc {
+    uint16_t index;
+    uint64_t counter;
+} VduseVirtqInflightDesc;
 
 struct VduseVirtq {
     VduseRing vring;
@@ -53,6 +79,10 @@ struct VduseVirtq {
     bool ready;
     EventNotifier kick_notifier;
     VduseVQHandler handler;
+    VduseVirtqInflightDesc *resubmit_list;
+    uint16_t resubmit_num;
+    uint64_t counter;
+    VduseVirtqLog *log;
     VduseDev *dev;
 };
 
@@ -79,6 +109,7 @@ struct VduseDev {
     VduseVirtq *vqs;
     VduseIovaRegion regions[MAX_IOVA_REGIONS];
     int num_regions;
+    void *log;
     char *name;
     uint32_t device_id;
     uint32_t vendor_id;
@@ -101,6 +132,7 @@ int vduse_dev_update_config(VduseDev *dev, uint32_t size,
 int vduse_dev_init(VduseDev *dev, const char *name, uint32_t device_id,
                    uint32_t vendor_id, uint64_t features, uint16_t num_queues,
                    uint32_t config_size, char *config);
+void vduse_dev_start(VduseDev *dev);
 void vduse_dev_cleanup(VduseDev *dev);
 
 #endif

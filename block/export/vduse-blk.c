@@ -190,6 +190,7 @@ static int vduse_blk_exp_create(BlockExport *exp, BlockExportOptions *opts,
     for (i = 0; i < vblk_opts->num_queues; i++) {
         vduse_queue_init(&dev->vqs[i], vblk_opts->queue_size, vduse_vq_handler);
     }
+    vduse_dev_start(dev);
 
     return 0;
 }
