@@ -65,7 +65,6 @@ static int vduse_blk_vq_process(VduseBlkExport *exp, VduseVirtq *vq)
     uint32_t type;
     unsigned in_num;
     unsigned out_num;
-    BlockBackend *blk = exp->export.blk;
 
     req = vduse_queue_pop(vq, sizeof(VduseBlkReq));
     if (!req) {
@@ -101,17 +100,28 @@ static int vduse_blk_vq_process(VduseBlkExport *exp, VduseVirtq *vq)
     case VIRTIO_BLK_T_IN:
     case VIRTIO_BLK_T_OUT: {
         bool is_write = type & VIRTIO_BLK_T_OUT;
+        char *data;
+        unsigned i;
 
         req->sector_num = le64toh(req->out->sector);
         if (is_write) {
             qemu_iovec_init_external(&req->qiov, &req->elem.out_sg[1], out_num);
-            blk_aio_pwritev(blk, req->sector_num << BDRV_SECTOR_BITS,
-                            &req->qiov, 0, vduse_blk_rw_complete, req);
+
+            data = malloc(req->qiov.size);
+            for (i = 0; i < out_num; i++) {
+                memcpy(data, req->qiov.iov[i].iov_base, req->qiov.iov[i].iov_len);
+            }
+            free(data);
         } else {
             qemu_iovec_init_external(&req->qiov, &req->elem.in_sg[0], in_num);
-            blk_aio_preadv(blk, req->sector_num << BDRV_SECTOR_BITS,
-                           &req->qiov, 0, vduse_blk_rw_complete, req);
+
+            data = malloc(req->qiov.size);
+            for (i = 0; i < in_num; i++) {
+                memcpy(req->qiov.iov[i].iov_base, data, req->qiov.iov[i].iov_len);
+            }
+            free(data);
         }
+        vduse_blk_rw_complete(req, 0);
         break;
     }
     case VIRTIO_BLK_T_FLUSH:
