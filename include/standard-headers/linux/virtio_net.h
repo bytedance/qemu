@@ -57,6 +57,8 @@
 					 * Steering */
 #define VIRTIO_NET_F_CTRL_MAC_ADDR 23	/* Set MAC address */
 
+#define VIRTIO_NET_F_ROCE	  55	/* Device supports RoCE */
+
 #define VIRTIO_NET_F_HASH_REPORT  57	/* Supports hash report */
 #define VIRTIO_NET_F_RSS	  60	/* Supports RSS RX steering */
 #define VIRTIO_NET_F_RSC_EXT	  61	/* extended coalescing info */
@@ -112,6 +114,10 @@ struct virtio_net_config {
 	uint16_t rss_max_indirection_table_length;
 	/* bitmask of supported VIRTIO_NET_RSS_HASH_ types */
 	uint32_t supported_hash_types;
+	/* Maximum number of queue pairs for RDMA usage */
+	uint32_t max_rdma_qps;
+	/* Maximum number of completion queues for RDMA usage */
+	uint32_t max_rdma_cqs;
 } QEMU_PACKED;
 
 /*

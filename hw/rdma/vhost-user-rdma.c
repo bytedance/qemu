@@ -27,7 +27,7 @@
 #include "sysemu/runstate.h"
 
 // FIXME: should read from slave
-#define VHOST_USER_RDMA_NUM_QUEUES 2
+#define VHOST_USER_RDMA_NUM_QUEUES (195) // 2 + 1 + 64 * 2 + 64
 #define VHOST_USER_RDMA_QUEUE_SIZE 1024
 
 static const int user_feature_bits[] = {
@@ -35,6 +35,8 @@ static const int user_feature_bits[] = {
     VIRTIO_RING_F_INDIRECT_DESC,
     VIRTIO_RING_F_EVENT_IDX,
     VIRTIO_F_NOTIFY_ON_EMPTY,
+    VIRTIO_NET_F_CTRL_VQ,
+    VIRTIO_NET_F_ROCE,
     VHOST_INVALID_FEATURE_BIT
 };
 
@@ -289,6 +291,9 @@ static uint64_t vhost_user_rdma_get_features(VirtIODevice *vdev,
                                             Error **errp)
 {
     VHostUserRdma *s = VHOST_USER_RDMA(vdev);
+
+    virtio_add_feature(&features, VIRTIO_NET_F_CTRL_VQ);
+    virtio_add_feature(&features, VIRTIO_NET_F_ROCE);
 
     return vhost_get_features(&s->dev, user_feature_bits, features);
 }
