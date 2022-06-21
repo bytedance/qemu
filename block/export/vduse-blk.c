@@ -11,6 +11,7 @@
  */
 
 #include <sys/eventfd.h>
+#include <malloc.h>
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
@@ -138,9 +139,52 @@ static void vduse_blk_disable_queue(VduseDev *dev, VduseVirtq *vq)
                        true, NULL, NULL, NULL, NULL, NULL);
 }
 
+#define USE_HUGE_PAGE 0
+
+const char *huge_file = "/dev/hugepages/vduse_blk_mem";
+
+static void *vduse_blk_reg_umem(VduseDev *dev, size_t size)
+{
+    void *ptr = NULL;
+#if USE_HUGE_PAGE
+    int fd;
+
+    fd = open(huge_file, O_RDWR | O_CREAT, 0600);
+    if (fd == -1) {
+        return NULL;
+    }
+
+    if (ftruncate(fd, size) == -1) {
+        goto out;
+    }
+
+    ptr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) {
+        ptr = NULL;
+    }
+out:
+    close(fd);
+#else
+    ptr = memalign(4096, size);
+#endif
+    return ptr;
+}
+
+static void vduse_blk_dereg_umem(VduseDev *dev, void *addr, size_t size)
+{
+#if USE_HUGE_PAGE
+    munmap(addr, size);
+    unlink(huge_file);
+#else
+    free(addr);
+#endif
+}
+
 static const VduseOps vduse_blk_ops = {
     .enable_queue = vduse_blk_enable_queue,
     .disable_queue = vduse_blk_disable_queue,
+    .reg_umem = vduse_blk_reg_umem,
+    .dereg_umem = vduse_blk_dereg_umem,
 };
 
 static void on_vduse_dev_kick(void *opaque)
