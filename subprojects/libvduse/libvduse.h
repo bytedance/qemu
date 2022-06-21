@@ -30,6 +30,10 @@ typedef struct VduseOps {
     void (*enable_queue)(VduseDev *dev, VduseVirtq *vq);
     /* Called when virtqueue processing should be stopped */
     void (*disable_queue)(VduseDev *dev, VduseVirtq *vq);
+    /* Called when we can register userspace memory for I/O, optional */
+    void *(*reg_umem)(VduseDev *dev, size_t size);
+    /* Called when we need to de-register userspace memory, optional */
+    void (*dereg_umem)(VduseDev *dev, void *uaddr, size_t size);
 } VduseOps;
 
 /* Describing elements of the I/O buffer */

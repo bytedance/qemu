@@ -112,6 +112,7 @@ typedef struct VduseIovaRegion {
     uint64_t size;
     uint64_t mmap_offset;
     uint64_t mmap_addr;
+    bool is_umem;
 } VduseIovaRegion;
 
 struct VduseDev {
@@ -307,6 +308,28 @@ static int vduse_queue_inflight_post_put(VduseVirtq *vq, int desc_idx)
     return 0;
 }
 
+static int vduse_dev_reg_umem(VduseDev *dev, void *uaddr,
+                              uint64_t iova, uint64_t size)
+{
+    struct vduse_iova_umem umem = { 0 };
+
+    umem.uaddr = (uint64_t)(uintptr_t)uaddr;
+    umem.iova = iova;
+    umem.size = size;
+
+    return ioctl(dev->fd, VDUSE_IOTLB_REG_UMEM, &umem);
+}
+
+static int vduse_dev_dereg_umem(VduseDev *dev, uint64_t iova,
+                                uint64_t size)
+{
+    struct vduse_iova_umem umem = { 0 };
+
+    umem.iova = iova;
+    umem.size = size;
+    return ioctl(dev->fd, VDUSE_IOTLB_DEREG_UMEM, &umem);
+}
+
 static void vduse_iova_remove_region(VduseDev *dev, uint64_t start,
                                      uint64_t last)
 {
@@ -323,19 +346,45 @@ static void vduse_iova_remove_region(VduseDev *dev, uint64_t start,
 
         if (start <= dev->regions[i].iova &&
             last >= (dev->regions[i].iova + dev->regions[i].size - 1)) {
-            munmap((void *)(uintptr_t)dev->regions[i].mmap_addr,
-                   dev->regions[i].mmap_offset + dev->regions[i].size);
+            if (dev->regions[i].is_umem) {
+                dev->ops->dereg_umem(dev,
+                                (void *)(uintptr_t)dev->regions[i].mmap_addr,
+                                dev->regions[i].size);
+                vduse_dev_dereg_umem(dev, dev->regions[i].iova,
+                                     dev->regions[i].size);
+            } else {
+                munmap((void *)(uintptr_t)dev->regions[i].mmap_addr,
+                       dev->regions[i].mmap_offset + dev->regions[i].size);
+            }
             dev->regions[i].mmap_addr = 0;
             dev->num_regions--;
         }
     }
 }
 
-static int vduse_iova_add_region(VduseDev *dev, int fd,
-                                 uint64_t offset, uint64_t start,
-                                 uint64_t last, int prot)
+static void vduse_iova_add_region(VduseDev *dev, void *addr, uint64_t offset,
+                                  uint64_t start, uint64_t size, bool is_umem)
 {
     int i;
+
+    for (i = 0; i < MAX_IOVA_REGIONS; i++) {
+        if (!dev->regions[i].mmap_addr) {
+            dev->regions[i].mmap_addr = (uint64_t)(uintptr_t)addr;
+            dev->regions[i].mmap_offset = offset;
+            dev->regions[i].iova = start;
+            dev->regions[i].size = size;
+            dev->regions[i].is_umem = is_umem;
+            dev->num_regions++;
+            break;
+        }
+    }
+    assert(i < MAX_IOVA_REGIONS);
+}
+
+static int vduse_iova_add_region_with_fd(VduseDev *dev, int fd,
+                                         uint64_t offset, uint64_t start,
+                                         uint64_t last, int prot)
+{
     uint64_t size = last - start + 1;
     void *mmap_addr = mmap(0, size + offset, prot, MAP_SHARED, fd, 0);
 
@@ -344,17 +393,7 @@ static int vduse_iova_add_region(VduseDev *dev, int fd,
         return -EINVAL;
     }
 
-    for (i = 0; i < MAX_IOVA_REGIONS; i++) {
-        if (!dev->regions[i].mmap_addr) {
-            dev->regions[i].mmap_addr = (uint64_t)(uintptr_t)mmap_addr;
-            dev->regions[i].mmap_offset = offset;
-            dev->regions[i].iova = start;
-            dev->regions[i].size = size;
-            dev->num_regions++;
-            break;
-        }
-    }
-    assert(i < MAX_IOVA_REGIONS);
+    vduse_iova_add_region(dev, mmap_addr, offset, start, size, false);
     close(fd);
 
     return 0;
@@ -385,6 +424,7 @@ static inline void *iova_to_va(VduseDev *dev, uint64_t *plen, uint64_t iova)
 {
     int i, ret;
     struct vduse_iotlb_entry entry;
+    struct vduse_iova_info info = { 0 };
 
     for (i = 0; i < MAX_IOVA_REGIONS; i++) {
         VduseIovaRegion *r = &dev->regions[i];
@@ -402,6 +442,29 @@ static inline void *iova_to_va(VduseDev *dev, uint64_t *plen, uint64_t iova)
         }
     }
 
+    info.start = iova;
+    info.last = iova + 1;
+    ret = ioctl(dev->fd, VDUSE_IOTLB_GET_INFO, &info);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to get iova info: %s\n", strerror(errno));
+        return NULL;
+    }
+
+    if ((info.capability & VDUSE_IOVA_CAP_UMEM) && dev->ops->reg_umem) {
+        uint64_t size = info.last - info.start + 1;
+        void *uaddr = dev->ops->reg_umem(dev, size);
+
+        if (uaddr) {
+            if (vduse_dev_reg_umem(dev, uaddr, info.start, size)) {
+                fprintf(stderr, "Failed to reg umem: %s\n", strerror(errno));
+                dev->ops->dereg_umem(dev, uaddr, size);
+                return NULL;
+            }
+            vduse_iova_add_region(dev, uaddr, 0, info.start, size, true);
+            return iova_to_va(dev, plen, iova);
+        }
+    }
+
     entry.start = iova;
     entry.last = iova + 1;
     ret = ioctl(dev->fd, VDUSE_IOTLB_GET_FD, &entry);
@@ -409,8 +472,8 @@ static inline void *iova_to_va(VduseDev *dev, uint64_t *plen, uint64_t iova)
         return NULL;
     }
 
-    if (!vduse_iova_add_region(dev, ret, entry.offset, entry.start,
-                               entry.last, perm_to_prot(entry.perm))) {
+    if (!vduse_iova_add_region_with_fd(dev, ret, entry.offset, entry.start,
+                                       entry.last, perm_to_prot(entry.perm))) {
         return iova_to_va(dev, plen, iova);
     }
 
