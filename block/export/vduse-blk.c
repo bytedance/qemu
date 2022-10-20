@@ -32,6 +32,7 @@ typedef struct VduseBlkExport {
     uint16_t num_queues;
     char *recon_file;
     unsigned int inflight;
+    int fd;
 } VduseBlkExport;
 
 typedef struct VduseBlkReq {
@@ -59,21 +60,96 @@ static void vduse_blk_req_complete(VduseBlkReq *req, size_t in_len)
     free(req);
 }
 
-static void coroutine_fn vduse_blk_virtio_process_req(void *opaque)
+struct virtio_blk_inhdr {
+    unsigned char status;
+};
+
+static int vduse_blk_process_req(int fd, VduseDesc *in_iov, VduseDesc *out_iov,
+                                  unsigned int in_num, unsigned int out_num)
 {
-    VduseBlkReq *req = opaque;
+    struct virtio_blk_inhdr in;
+    struct virtio_blk_outhdr out;
+    uint32_t type;
+    ssize_t ret;
+    int in_len, out_len;
+
+    if (out_num < 1 || in_num < 1) {
+        error_report("virtio-blk request missing headers");
+        return -EINVAL;
+    }
+
+    if (unlikely(vduse_write_to_buf(out_iov, out_num, 0, &out,
+                            sizeof(out)) != sizeof(out))) {
+        error_report("virtio-blk request outhdr too short");
+        return -EINVAL;
+    }
+
+    if (in_iov[in_num - 1].iov.iov_len < sizeof(struct virtio_blk_inhdr)) {
+        error_report("virtio-blk request inhdr too short");
+        return -EINVAL;
+    }
+
+    /* We always touch the last byte, so just see how big in_iov is. */
+    in_len = vduse_iov_size(in_iov, in_num);
+    out_len = vduse_iov_size(out_iov, out_num);
+
+    type = le32_to_cpu(out.type);
+    switch (type & ~VIRTIO_BLK_T_BARRIER) {
+    case VIRTIO_BLK_T_IN:
+    case VIRTIO_BLK_T_OUT: {
+        int64_t offset;
+        bool is_write = type & VIRTIO_BLK_T_OUT;
+        int64_t sector_num = le64_to_cpu(out.sector);
+
+        offset = sector_num << VIRTIO_BLK_SECTOR_BITS;
+
+        if (is_write) {
+            ret = vduse_splice_to_fd(out_iov, out_num, sizeof(out), fd, offset, out_len - sizeof(out));
+            if (ret != out_len - sizeof(out)) {
+	        error_report("invalid write size: %ld vs. %d", ret, out_len);
+            }
+            assert(ret == out_len - sizeof(out));
+        } else {
+            ret = vduse_splice_from_fd(in_iov, in_num, 0, fd, offset,
+                                 in_len - sizeof(in));
+            if (ret != in_len - sizeof(in)) {
+	        error_report("invalid read size: %ld vs. %ld", ret, in_len - sizeof(in));
+            }
+            assert(ret == in_len - sizeof(in));
+        }
+        in.status = VIRTIO_BLK_S_OK;
+        ret = vduse_read_from_buf(in_iov, in_num,
+                                  in_len - sizeof(in),
+                                  &in, sizeof(in));
+        assert(ret == sizeof(in));
+        break;
+    }
+    default:
+        in.status = VIRTIO_BLK_S_UNSUPP;
+        ret = vduse_read_from_buf(in_iov, in_num,
+                                  in_len - sizeof(in),
+                                  &in, sizeof(in));
+        assert(ret == sizeof(in));
+        break;
+    }
+
+    return in_len;
+}
+
+
+static void vduse_blk_virtio_process_req(VduseBlkReq *req)
+{
     VduseVirtq *vq = req->vq;
     VduseDev *dev = vduse_queue_get_dev(vq);
     VduseBlkExport *vblk_exp = vduse_dev_get_priv(dev);
-    VirtioBlkHandler *handler = &vblk_exp->handler;
     VduseVirtqElement *elem = &req->elem;
-    struct iovec *in_iov = elem->in_sg;
-    struct iovec *out_iov = elem->out_sg;
+    VduseDesc *in_iov = elem->in_sg;
+    VduseDesc *out_iov = elem->out_sg;
     unsigned in_num = elem->in_num;
     unsigned out_num = elem->out_num;
     int in_len;
 
-    in_len = virtio_blk_process_req(handler, in_iov,
+    in_len = vduse_blk_process_req(vblk_exp->fd, in_iov,
                                     out_iov, in_num, out_num);
     if (in_len < 0) {
         free(req);
@@ -97,11 +173,9 @@ static void vduse_blk_vq_handler(VduseDev *dev, VduseVirtq *vq)
         }
         req->vq = vq;
 
-        Coroutine *co =
-            qemu_coroutine_create(vduse_blk_virtio_process_req, req);
-
         vduse_blk_inflight_inc(vblk_exp);
-        qemu_coroutine_enter(co);
+
+        vduse_blk_virtio_process_req(req);
     }
 }
 
@@ -224,6 +298,17 @@ static const BlockDevOps vduse_block_ops = {
     .resize_cb = vduse_blk_resize,
 };
 
+static ssize_t vduse_blk_size(const char *filename)
+{
+    struct stat st;
+
+    if (stat(filename, &st) < 0) {
+        return -1;
+    }
+
+    return st.st_size;
+}
+
 static int vduse_blk_exp_create(BlockExport *exp, BlockExportOptions *opts,
                                 Error **errp)
 {
@@ -263,6 +348,16 @@ static int vduse_blk_exp_create(BlockExport *exp, BlockExportOptions *opts,
             return -EINVAL;
         }
     }
+
+    vblk_exp->fd = open(vblk_opts->test_file, O_RDWR);
+    if (vblk_exp->fd < 0) {
+        error_setg(errp, "Failed to open test file %s, errno: %d",
+                   vblk_opts->test_file, errno);
+        return -EINVAL;
+    }
+
+
+
     vblk_exp->num_queues = num_queues;
     vblk_exp->handler.blk = exp->blk;
     vblk_exp->handler.serial = g_strdup(vblk_opts->has_serial ?
@@ -271,7 +366,7 @@ static int vduse_blk_exp_create(BlockExport *exp, BlockExportOptions *opts,
     vblk_exp->handler.writable = opts->writable;
 
     config.capacity =
-            cpu_to_le64(blk_getlength(exp->blk) >> VIRTIO_BLK_SECTOR_BITS);
+            cpu_to_le64(vduse_blk_size(vblk_opts->test_file) >> VIRTIO_BLK_SECTOR_BITS);
     config.seg_max = cpu_to_le32(queue_size - 2);
     config.min_io_size = cpu_to_le16(1);
     config.opt_io_size = cpu_to_le32(1);
@@ -288,10 +383,10 @@ static int vduse_blk_exp_create(BlockExport *exp, BlockExportOptions *opts,
     features = vduse_get_virtio_features() |
                (1ULL << VIRTIO_BLK_F_SEG_MAX) |
                (1ULL << VIRTIO_BLK_F_TOPOLOGY) |
-               (1ULL << VIRTIO_BLK_F_BLK_SIZE) |
-               (1ULL << VIRTIO_BLK_F_FLUSH) |
-               (1ULL << VIRTIO_BLK_F_DISCARD) |
-               (1ULL << VIRTIO_BLK_F_WRITE_ZEROES);
+               (1ULL << VIRTIO_BLK_F_BLK_SIZE);
+//               (1ULL << VIRTIO_BLK_F_FLUSH) |
+//               (1ULL << VIRTIO_BLK_F_DISCARD) |
+//               (1ULL << VIRTIO_BLK_F_WRITE_ZEROES);
 
     if (num_queues > 1) {
         features |= 1ULL << VIRTIO_BLK_F_MQ;

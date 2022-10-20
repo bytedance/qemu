@@ -197,7 +197,8 @@
             '*num-queues': 'uint16',
             '*queue-size': 'uint16',
             '*logical-block-size': 'size',
-            '*serial': 'str' } }
+            '*serial': 'str',
+            'test-file': 'str' } }
 
 ##
 # @NbdServerAddOptions:
