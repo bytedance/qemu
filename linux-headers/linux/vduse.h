@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
-#ifndef _VDUSE_H_
-#define _VDUSE_H_
+#ifndef _UAPI_VDUSE_H_
+#define _UAPI_VDUSE_H_
 
 #include <linux/types.h>
 
@@ -27,6 +27,8 @@
  * @features: virtio features
  * @vq_num: the number of virtqueues
  * @vq_align: the allocation alignment of virtqueue's metadata
+ * @enable_zc: enable zero copy mode
+ * @reserved2: for future use, needs to be initialized to zero
  * @reserved: for future use, needs to be initialized to zero
  * @config_size: the size of the configuration space
  * @config: the buffer of the configuration space
@@ -41,7 +43,10 @@ struct vduse_dev_config {
 	__u64 features;
 	__u32 vq_num;
 	__u32 vq_align;
-	__u32 reserved[13];
+	__u8 enable_zc;
+	__u8 reserved2[3];
+	__u32 zc_size;
+	__u32 reserved[11];
 	__u32 config_size;
 	__u8 config[];
 };
@@ -238,6 +243,8 @@ struct vduse_iova_umem {
  * @start: start of the IOVA region
  * @last: last of the IOVA region
  * @capability: capability of the IOVA regsion
+ * @addr_mask: the mask of the physical address,
+ *             valid only when VDUSE_IOVA_CAP_ZERO_COPY is set
  * @reserved: for future use, needs to be initialized to zero
  *
  * Structure used by VDUSE_IOTLB_GET_INFO ioctl to get information of
@@ -247,8 +254,10 @@ struct vduse_iova_info {
 	__u64 start;
 	__u64 last;
 #define VDUSE_IOVA_CAP_UMEM (1 << 0)
+#define VDUSE_IOVA_CAP_ZERO_COPY (1 << 1)
 	__u64 capability;
-	__u64 reserved[3];
+	__u64 addr_mask;
+	__u64 reserved[2];
 };
 
 /*
@@ -350,4 +359,4 @@ struct vduse_dev_response {
 	};
 };
 
-#endif /* _VDUSE_H_ */
+#endif /* _UAPI_VDUSE_H_ */

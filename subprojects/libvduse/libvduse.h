@@ -32,6 +32,11 @@ typedef struct VduseOps {
     void (*disable_queue)(VduseDev *dev, VduseVirtq *vq);
 } VduseOps;
 
+typedef struct VduseDesc {
+    struct iovec iov;
+    int rwfd;
+} VduseDesc;
+
 /* Describing elements of the I/O buffer */
 typedef struct VduseVirtqElement {
     /* Descriptor table index */
@@ -41,9 +46,9 @@ typedef struct VduseVirtqElement {
     /* Number of physically-contiguous device-writable descriptors */
     unsigned int in_num;
     /* Array to store physically-contiguous device-writable descriptors */
-    struct iovec *in_sg;
+    VduseDesc *in_sg;
     /* Array to store physically-contiguous device-readable descriptors */
-    struct iovec *out_sg;
+    VduseDesc *out_sg;
 } VduseVirtqElement;
 
 
@@ -136,6 +141,20 @@ VduseVirtq *vduse_dev_get_queue(VduseDev *dev, int index);
  * Returns: file descriptor on success, -1 on failure.
  */
 int vduse_dev_get_fd(VduseDev *dev);
+
+size_t vduse_write_to_buf(const VduseDesc *desc, const unsigned int cnt,
+                          size_t offset, void *buf, size_t bytes);
+
+size_t vduse_read_from_buf(const VduseDesc *desc, const unsigned int cnt,
+                           size_t offset, void *buf, size_t bytes);
+
+size_t vduse_splice_from_fd(const VduseDesc *desc, const unsigned int cnt,
+                            size_t offset, int fd, size_t fd_off, size_t bytes);
+
+size_t vduse_splice_to_fd(const VduseDesc *desc, const unsigned int cnt,
+                          size_t offset, int fd, size_t fd_off, size_t bytes);
+
+size_t vduse_iov_size(const VduseDesc *desc, const unsigned int iov_cnt);
 
 /**
  * vduse_dev_handler:

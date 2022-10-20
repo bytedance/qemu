@@ -40,9 +40,17 @@
 #include "libvduse.h"
 
 #define VDUSE_VQ_ALIGN 4096
-#define MAX_IOVA_REGIONS 256
+#define MAX_IOVA_REGIONS 1024
 
 #define LOG_ALIGNMENT 64
+
+#ifndef MIN
+#define MIN(x, y) ({                            \
+            typeof(x) _min1 = (x);              \
+            typeof(y) _min2 = (y);              \
+            (void) (&_min1 == &_min2);          \
+            _min1 < _min2 ? _min1 : _min2; })
+#endif
 
 /* Round number down to multiple */
 #define ALIGN_DOWN(n, m) ((n) / (m) * (m))
@@ -112,6 +120,7 @@ typedef struct VduseIovaRegion {
     uint64_t size;
     uint64_t mmap_offset;
     uint64_t mmap_addr;
+    int rwfd;
 } VduseIovaRegion;
 
 struct VduseDev {
@@ -129,6 +138,7 @@ struct VduseDev {
     int ctrl_fd;
     void *priv;
     void *log;
+    uint64_t phys_mask;
 };
 
 static inline size_t vduse_vq_log_size(uint16_t queue_size)
@@ -174,8 +184,8 @@ uint64_t vduse_get_virtio_features(void)
     return (1ULL << VIRTIO_F_IOMMU_PLATFORM) |
            (1ULL << VIRTIO_F_VERSION_1) |
            (1ULL << VIRTIO_F_NOTIFY_ON_EMPTY) |
-           (1ULL << VIRTIO_RING_F_EVENT_IDX) |
-           (1ULL << VIRTIO_RING_F_INDIRECT_DESC);
+           (1ULL << VIRTIO_RING_F_EVENT_IDX);
+//           (1ULL << VIRTIO_RING_F_INDIRECT_DESC);
 }
 
 VduseDev *vduse_queue_get_dev(VduseVirtq *vq)
@@ -323,19 +333,38 @@ static void vduse_iova_remove_region(VduseDev *dev, uint64_t start,
 
         if (start <= dev->regions[i].iova &&
             last >= (dev->regions[i].iova + dev->regions[i].size - 1)) {
-            munmap((void *)(uintptr_t)dev->regions[i].mmap_addr,
-                   dev->regions[i].mmap_offset + dev->regions[i].size);
+            if (dev->regions[i].rwfd == -1)
+                munmap((void *)(uintptr_t)dev->regions[i].mmap_addr,
+                       dev->regions[i].mmap_offset + dev->regions[i].size);
             dev->regions[i].mmap_addr = 0;
             dev->num_regions--;
         }
     }
 }
 
-static int vduse_iova_add_region(VduseDev *dev, int fd,
-                                 uint64_t offset, uint64_t start,
-                                 uint64_t last, int prot)
+static void vduse_iova_add_region(VduseDev *dev, void *addr, uint64_t offset,
+                                  uint64_t start, uint64_t size, int fd)
 {
     int i;
+
+    for (i = 0; i < MAX_IOVA_REGIONS; i++) {
+        if (!dev->regions[i].mmap_addr) {
+            dev->regions[i].mmap_addr = (uint64_t)(uintptr_t)addr;
+            dev->regions[i].mmap_offset = offset;
+            dev->regions[i].iova = start;
+            dev->regions[i].size = size;
+            dev->regions[i].rwfd = fd;
+            dev->num_regions++;
+            break;
+        }
+    }
+    assert(i < MAX_IOVA_REGIONS);
+}
+
+static int vduse_iova_add_region_with_fd(VduseDev *dev, int fd,
+                                         uint64_t offset, uint64_t start,
+                                         uint64_t last, int prot)
+{
     uint64_t size = last - start + 1;
     void *mmap_addr = mmap(0, size + offset, prot, MAP_SHARED, fd, 0);
 
@@ -344,17 +373,7 @@ static int vduse_iova_add_region(VduseDev *dev, int fd,
         return -EINVAL;
     }
 
-    for (i = 0; i < MAX_IOVA_REGIONS; i++) {
-        if (!dev->regions[i].mmap_addr) {
-            dev->regions[i].mmap_addr = (uint64_t)(uintptr_t)mmap_addr;
-            dev->regions[i].mmap_offset = offset;
-            dev->regions[i].iova = start;
-            dev->regions[i].size = size;
-            dev->num_regions++;
-            break;
-        }
-    }
-    assert(i < MAX_IOVA_REGIONS);
+    vduse_iova_add_region(dev, mmap_addr, offset, start, size, -1);
     close(fd);
 
     return 0;
@@ -381,10 +400,11 @@ static int perm_to_prot(uint8_t perm)
     return prot;
 }
 
-static inline void *iova_to_va(VduseDev *dev, uint64_t *plen, uint64_t iova)
+static inline void *iova_to_va(VduseDev *dev, uint64_t *plen, uint64_t iova, int *fd)
 {
     int i, ret;
     struct vduse_iotlb_entry entry;
+    struct vduse_iova_info info = { 0 };
 
     for (i = 0; i < MAX_IOVA_REGIONS; i++) {
         VduseIovaRegion *r = &dev->regions[i];
@@ -393,13 +413,42 @@ static inline void *iova_to_va(VduseDev *dev, uint64_t *plen, uint64_t iova)
             continue;
         }
 
-        if ((iova >= r->iova) && (iova < (r->iova + r->size))) {
-            if ((iova + *plen) > (r->iova + r->size)) {
+        if ((iova >= r->iova) && (iova <= (r->iova + r->size - 1))) {
+            if ((iova + *plen) >= (r->iova + r->size - 1)) {
                 *plen = r->iova + r->size - iova;
+            }
+            if (fd) {
+                *fd =  r->rwfd;
             }
             return (void *)(uintptr_t)(iova - r->iova +
                    r->mmap_addr + r->mmap_offset);
         }
+    }
+
+    info.start = iova;
+    info.last = iova + 1;
+    ret = ioctl(dev->fd, VDUSE_IOTLB_GET_INFO, &info);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to get iova info: %s\n", strerror(errno));
+        return NULL;
+    }
+
+    if (info.capability & VDUSE_IOVA_CAP_ZERO_COPY) {
+        uint64_t size = info.last - info.start + 1;
+
+        entry.start = iova;
+        entry.last = iova + 1;
+        ret = ioctl(dev->fd, VDUSE_IOTLB_GET_FD, &entry);
+        if (ret < 0) {
+            return NULL;
+        }
+
+        fprintf(stderr, "Add zero copy region start: %llx, last: %llx, iova: %lx\n",
+                info.start, info.last, iova);
+        vduse_iova_add_region(dev, (void *)info.start, 0, info.start, size, ret);
+        dev->phys_mask = info.addr_mask;
+
+        return iova_to_va(dev, plen, iova, fd);
     }
 
     entry.start = iova;
@@ -409,9 +458,9 @@ static inline void *iova_to_va(VduseDev *dev, uint64_t *plen, uint64_t iova)
         return NULL;
     }
 
-    if (!vduse_iova_add_region(dev, ret, entry.offset, entry.start,
+    if (!vduse_iova_add_region_with_fd(dev, ret, entry.offset, entry.start,
                                entry.last, perm_to_prot(entry.perm))) {
-        return iova_to_va(dev, plen, iova);
+        return iova_to_va(dev, plen, iova, fd);
     }
 
     return NULL;
@@ -463,6 +512,7 @@ vduse_queue_read_indirect_desc(VduseDev *dev, struct vring_desc *desc,
 {
     struct vring_desc *ori_desc;
     uint64_t read_len;
+    int fd;
 
     if (len > (VIRTQUEUE_MAX_SIZE * sizeof(struct vring_desc))) {
         return -1;
@@ -474,8 +524,8 @@ vduse_queue_read_indirect_desc(VduseDev *dev, struct vring_desc *desc,
 
     while (len) {
         read_len = len;
-        ori_desc = iova_to_va(dev, &read_len, addr);
-        if (!ori_desc) {
+        ori_desc = iova_to_va(dev, &read_len, addr, &fd);
+        if (!ori_desc || fd == -1) {
             return -1;
         }
 
@@ -582,7 +632,7 @@ static inline void vring_set_avail_event(VduseVirtq *vq, uint16_t val)
 }
 
 static bool vduse_queue_map_single_desc(VduseVirtq *vq, unsigned int *p_num_sg,
-                                   struct iovec *iov, unsigned int max_num_sg,
+                                   VduseDesc *desc, unsigned int max_num_sg,
                                    bool is_write, uint64_t pa, size_t sz)
 {
     unsigned num_sg = *p_num_sg;
@@ -597,6 +647,7 @@ static bool vduse_queue_map_single_desc(VduseVirtq *vq, unsigned int *p_num_sg,
 
     while (sz) {
         uint64_t len = sz;
+        int fd;
 
         if (num_sg == max_num_sg) {
             fprintf(stderr,
@@ -604,12 +655,13 @@ static bool vduse_queue_map_single_desc(VduseVirtq *vq, unsigned int *p_num_sg,
             return false;
         }
 
-        iov[num_sg].iov_base = iova_to_va(dev, &len, pa);
-        if (iov[num_sg].iov_base == NULL) {
-            fprintf(stderr, "virtio: invalid address for buffers\n");
+        desc[num_sg].iov.iov_base = iova_to_va(dev, &len, pa, &fd);
+        if (desc[num_sg].iov.iov_base == NULL) {
+            fprintf(stderr, "virtio: invalid address for buffers: %lx\n", pa);
             return false;
         }
-        iov[num_sg++].iov_len = len;
+        desc[num_sg].rwfd = fd;
+        desc[num_sg++].iov.iov_len = len;
         sz -= len;
         pa += len;
     }
@@ -647,10 +699,10 @@ static void *vduse_queue_map_desc(VduseVirtq *vq, unsigned int idx, size_t sz)
     unsigned int max = vq->vring.num;
     unsigned int i = idx;
     VduseVirtqElement *elem;
-    struct iovec iov[VIRTQUEUE_MAX_SIZE];
+    VduseDesc iov[VIRTQUEUE_MAX_SIZE];
     struct vring_desc desc_buf[VIRTQUEUE_MAX_SIZE];
     unsigned int out_num = 0, in_num = 0;
-    int rc;
+    int fd, rc;
 
     if (le16toh(desc[i].flags) & VRING_DESC_F_INDIRECT) {
         if (le32toh(desc[i].len) % sizeof(struct vring_desc)) {
@@ -663,7 +715,7 @@ static void *vduse_queue_map_desc(VduseVirtq *vq, unsigned int idx, size_t sz)
         desc_len = le32toh(desc[i].len);
         max = desc_len / sizeof(struct vring_desc);
         read_len = desc_len;
-        desc = iova_to_va(dev, &read_len, desc_addr);
+        desc = iova_to_va(dev, &read_len, desc_addr, &fd);
         if (unlikely(desc && read_len != desc_len)) {
             /* Failed to use zero copy */
             desc = NULL;
@@ -673,7 +725,7 @@ static void *vduse_queue_map_desc(VduseVirtq *vq, unsigned int idx, size_t sz)
                 desc = desc_buf;
             }
         }
-        if (!desc) {
+        if (!desc || fd != -1) {
             fprintf(stderr, "Invalid indirect buffer table\n");
             return NULL;
         }
@@ -851,22 +903,23 @@ static int vduse_queue_update_vring(VduseVirtq *vq, uint64_t desc_addr,
 {
     struct VduseDev *dev = vq->dev;
     uint64_t len;
+    int fd;
 
     len = sizeof(struct vring_desc);
-    vq->vring.desc = iova_to_va(dev, &len, desc_addr);
-    if (len != sizeof(struct vring_desc)) {
+    vq->vring.desc = iova_to_va(dev, &len, desc_addr, &fd);
+    if (len != sizeof(struct vring_desc) || fd != -1) {
         return -EINVAL;
     }
 
     len = sizeof(struct vring_avail);
-    vq->vring.avail = iova_to_va(dev, &len, avail_addr);
-    if (len != sizeof(struct vring_avail)) {
+    vq->vring.avail = iova_to_va(dev, &len, avail_addr, &fd);
+    if (len != sizeof(struct vring_avail) || fd != -1) {
         return -EINVAL;
     }
 
     len = sizeof(struct vring_used);
-    vq->vring.used = iova_to_va(dev, &len, used_addr);
-    if (len != sizeof(struct vring_used)) {
+    vq->vring.used = iova_to_va(dev, &len, used_addr, &fd);
+    if (len != sizeof(struct vring_used) || fd != -1) {
         return -EINVAL;
     }
 
@@ -991,6 +1044,314 @@ static void vduse_dev_stop_dataplane(VduseDev *dev)
     }
     dev->features = 0;
     vduse_iova_remove_region(dev, 0, ULONG_MAX);
+}
+
+size_t vduse_write_to_buf(const VduseDesc *desc, const unsigned int cnt,
+                          size_t offset, void *buf, size_t bytes)
+{
+    size_t done;
+    unsigned int i;
+
+    for (i = 0, done = 0; (offset || done < bytes) && i < cnt; i++) {
+        if (offset < desc[i].iov.iov_len) {
+            ssize_t res, len = MIN(desc[i].iov.iov_len - offset, bytes - done);
+
+            if (desc[i].rwfd == -1) {
+                memcpy(buf + done, desc[i].iov.iov_base + offset, len);
+            } else {
+                res = pread(desc[i].rwfd, buf + done, len,
+                           (uint64_t)(uintptr_t)(desc[i].iov.iov_base + offset));
+                if (res != len) {
+                    fprintf(stderr, "Failed to read buf from fd: %d,"
+                            "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            desc[i].rwfd,
+                            (uint64_t)(uintptr_t)(desc[i].iov.iov_base + offset),
+                            len, res, errno);
+                    return done;
+                }
+            }
+            done += len;
+            offset = 0;
+        } else {
+            offset -= desc[i].iov.iov_len;
+        }
+    }
+    assert(offset == 0);
+    return done;
+}
+
+size_t vduse_read_from_buf(const VduseDesc *desc, const unsigned int cnt,
+                           size_t offset, void *buf, size_t bytes)
+{
+    size_t done;
+    unsigned int i;
+
+    for (i = 0, done = 0; (offset || done < bytes) && i < cnt; i++) {
+        if (offset < desc[i].iov.iov_len) {
+            ssize_t res, len = MIN(desc[i].iov.iov_len - offset, bytes - done);
+
+            if (desc[i].rwfd == -1) {
+                memcpy(desc[i].iov.iov_base + offset, buf + done, len);
+            } else {
+                res = pwrite(desc[i].rwfd, buf + done, len,
+                            (uint64_t)(uintptr_t)(desc[i].iov.iov_base + offset));
+                if (res != len) {
+                    fprintf(stderr, "Failed to write buf to fd: %d,"
+                            "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            desc[i].rwfd,
+                            (uint64_t)(uintptr_t)(desc[i].iov.iov_base + offset),
+                            len, res, errno);
+                    return done;
+                }
+            }
+            done += len;
+            offset = 0;
+        } else {
+            offset -= desc[i].iov.iov_len;
+        }
+    }
+    assert(offset == 0);
+    return done;
+}
+
+static int pipefd[2] = { -1, -1 };
+
+static ssize_t vduse_do_splice(int fd_in, off64_t *off_in, int fd_out,
+                              off64_t *off_out, size_t len, unsigned int flags)
+{
+    ssize_t res;
+    size_t s_len = len;
+
+    while (s_len) {
+        res = splice(fd_in, off_in, fd_out, off_out, s_len,
+                     SPLICE_F_MORE |SPLICE_F_MOVE);
+        if (res <= 0) {
+            fprintf(stderr, "Failed to splice from fdin: %d, fdout: %d "
+                    "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                    fd_in, fd_out, off_in ? *off_in : *off_out, s_len, res, errno);
+            return res;
+        }
+        s_len -= res;
+    }
+
+    return len;
+}
+
+size_t vduse_splice_from_fd(const VduseDesc *desc, const unsigned int cnt,
+                            size_t offset, int fd, size_t fd_off, size_t bytes)
+{
+    size_t done, merges = 0;
+    ssize_t res;
+    unsigned int i, m = 0;
+    struct iovec iov[1024];
+//    int pipefd[2] = { -1, -1 };
+
+    assert(cnt < 1024);
+
+    for (i = 0, done = 0; (offset || done < bytes) && i < cnt; i++) {
+        if (offset < desc[i].iov.iov_len) {
+            size_t len = MIN(desc[i].iov.iov_len - offset, bytes - done);
+
+            if (desc[i].rwfd == -1) {
+                iov[m].iov_base = desc[i].iov.iov_base + offset;
+                iov[m].iov_len = len;
+                m++;
+                merges += len;
+            } else {
+                off64_t off;
+
+                if (pipefd[0] == -1 && pipefd[1] == -1) {
+                    assert(pipe(pipefd) == 0);
+                    assert(fcntl(pipefd[0], F_SETPIPE_SZ, 1024 * 1024) == 1024 * 1024);
+                }
+
+                if (merges > 0) {
+                    res = preadv(fd, iov, m, fd_off + done - merges);
+                    if (res != merges) {
+                       fprintf(stderr, "Failed to read iovec to fd: %d,"
+                               " offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                               fd, fd_off + done - merges, merges, res, errno);
+                       return done;
+                    }
+                    merges = 0;
+                    m = 0;
+                }
+#if 1
+                off = fd_off + done;
+		res = vduse_do_splice(fd, &off, pipefd[1], NULL, len,
+//                res = splice(fd, &off, pipefd[1], NULL, len,
+                             SPLICE_F_MORE |SPLICE_F_MOVE);
+                if (res != len) {
+                    fprintf(stderr, "Failed to splice from fd: %d, pipefd: %d"
+                            " offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            fd, pipefd[1], off, len, res, errno);
+                    return done;
+                }
+
+                off = (uint64_t)(uintptr_t)(desc[i].iov.iov_base + offset);
+                res = splice(pipefd[0], NULL, desc[i].rwfd, &off, len,
+                             SPLICE_F_MORE |SPLICE_F_MOVE);
+                if (res != len) {
+                    fprintf(stderr, "Failed to splice to fd: %d,"
+                            "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            desc[i].rwfd, off, len, res, errno);
+                    return done;
+                }
+#else
+                buf = g_malloc(len);
+                off = fd_off + done;
+                res = pread(fd, buf, len, off);
+                if (res != len) {
+                    fprintf(stderr, "Failed to read from fd: %d,"
+                            "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            fd, off, len, res, errno);
+                    return done;
+                }
+                off = (uint64_t)(uintptr_t)(desc[i].iov.iov_base + offset);
+                res = pwrite(desc[i].rwfd, buf, len, off);
+                if (res != len) {
+                    fprintf(stderr, "Failed to write to fd: %d,"
+                            "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            desc[i].rwfd, off, len, res, errno);
+                    return done;
+                }
+                g_free(buf);
+#endif
+            }
+            done += len;
+            offset = 0;
+        } else {
+            offset -= desc[i].iov.iov_len;
+        }
+    }
+
+    if (merges > 0) {
+        res = preadv(fd, iov, m, fd_off + done - merges);
+        if (res != merges) {
+           fprintf(stderr, "Failed to read iovec to fd: %d,"
+                   "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                   fd, fd_off + done - merges, merges, res, errno);
+           return done;
+        }
+        merges = 0;
+        m = 0;
+    }
+    assert(offset == 0);
+    return done;
+}
+
+size_t vduse_splice_to_fd(const VduseDesc *desc, const unsigned int cnt,
+                          size_t offset, int fd, size_t fd_off, size_t bytes)
+{
+    size_t done, merges = 0;
+    ssize_t res;
+    unsigned int i, m = 0;
+    struct iovec iov[1024];
+//    int pipefd[2] = { -1, -1 };
+
+    assert(cnt < 1024);
+
+    for (i = 0, done = 0; (offset || done < bytes) && i < cnt; i++) {
+        if (offset < desc[i].iov.iov_len) {
+            size_t len = MIN(desc[i].iov.iov_len - offset, bytes - done);
+
+            if (desc[i].rwfd == -1) {
+                iov[m].iov_base = desc[i].iov.iov_base + offset;
+                iov[m].iov_len = len;
+                m++;
+                merges += len;
+            } else {
+                off64_t off;
+
+                if (pipefd[0] == -1 && pipefd[1] == -1) {
+                    assert(pipe(pipefd) == 0);
+                    assert(fcntl(pipefd[0], F_SETPIPE_SZ, 1024 * 1024) == 1024 * 1024);
+                }
+
+                if (merges > 0) {
+                    res = pwritev(fd, iov, m, fd_off + done - merges);
+                    if (res != merges) {
+                        fprintf(stderr, "Failed to write iovec to fd: %d,"
+                                "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                                fd, fd_off + done - merges, merges, res, errno);
+                        return done;
+                    }
+                    merges = 0;
+                    m = 0;
+                }
+#if 1
+                off = (uint64_t)(uintptr_t)(desc[i].iov.iov_base + offset);
+                res = splice(desc[i].rwfd, &off, pipefd[1], NULL, len,
+                             SPLICE_F_MORE | SPLICE_F_MOVE);
+                if (res != len) {
+                    fprintf(stderr, "Failed to splice from fd: %d,"
+                            "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            desc[i].rwfd, off, len, res, errno);
+                    return done;
+                }
+
+                off = fd_off + done;
+                res = splice(pipefd[0], NULL, fd, &off, len,
+                             SPLICE_F_MORE | SPLICE_F_MOVE);
+                if (res != len) {
+                    fprintf(stderr, "Failed to splice to fd: %d,"
+                            "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            fd, off, len, res, errno);
+                    return done;
+                }
+#else
+                buf = g_malloc(len);
+                off = (uint64_t)(uintptr_t)(desc[i].iov.iov_base + offset);
+                res = pread(desc[i].rwfd, buf, len, off);
+                if (res != len) {
+                    fprintf(stderr, "Failed to read from fd: %d,"
+                            "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            desc[i].rwfd, off, len, res, errno);
+                    return done;
+                }
+                off = fd_off + done;
+                res = pwrite(fd, buf, len, off);
+                if (res != len) {
+                    fprintf(stderr, "Failed to write to fd: %d,"
+                            "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                            fd, off, len, res, errno);
+                    return done;
+                }
+                g_free(buf);
+#endif
+            }
+            done += len;
+            offset = 0;
+        } else {
+            offset -= desc[i].iov.iov_len;
+        }
+    }
+
+    if (merges > 0) {
+        res = pwritev(fd, iov, m, fd_off + done - merges);
+        if (res != merges) {
+            fprintf(stderr, "Failed to read iovec to fd: %d,"
+                    "offset: %lx, len: %lx, res: %ld, errno: %d\n",
+                    fd, fd_off + done - merges, merges, res, errno);
+            return done;
+        }
+        merges = 0;
+        m = 0;
+    }
+    assert(offset == 0);
+    return done;
+}
+
+size_t vduse_iov_size(const VduseDesc *desc, const unsigned int iov_cnt)
+{
+    size_t len;
+    unsigned int i;
+
+    len = 0;
+    for (i = 0; i < iov_cnt; i++) {
+        len += desc[i].iov.iov_len;
+    }
+    return len;
 }
 
 int vduse_dev_handler(VduseDev *dev)
@@ -1317,6 +1678,8 @@ VduseDev *vduse_dev_create(const char *name, uint32_t device_id,
     dev_config->vq_num = num_queues;
     dev_config->vq_align = VDUSE_VQ_ALIGN;
     dev_config->config_size = config_size;
+    dev_config->enable_zc = 1;
+    dev_config->zc_size = 4096;
     memcpy(dev_config->config, config, config_size);
 
     ret = ioctl(ctrl_fd, VDUSE_CREATE_DEV, dev_config);
