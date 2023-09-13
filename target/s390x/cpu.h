@@ -174,7 +174,6 @@ struct ArchCPU {
     CPUState parent_obj;
     /*< public >*/
 
-    CPUNegativeOffsetState neg;
     CPUS390XState env;
     S390CPUModel *model;
     /* needed for live migration */

@@ -2006,7 +2006,6 @@ struct ArchCPU {
     CPUState parent_obj;
     /*< public >*/
 
-    CPUNegativeOffsetState neg;
     CPUX86State env;
     VMChangeStateEntry *vmsentry;
 
