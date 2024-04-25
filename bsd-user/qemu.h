@@ -37,6 +37,7 @@ extern char **environ;
 #include "target.h"
 #include "exec/gdbstub.h"
 #include "qemu/clang-tsa.h"
+#include "accel/tcg/vcpu-state.h"
 
 /*
  * This struct is used to hold certain information about the image.  Basically,
