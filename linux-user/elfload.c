@@ -4400,7 +4400,7 @@ static int write_note_info(struct elf_note_info *info, int fd)
  */
 static int elf_core_dump(int signr, const CPUArchState *env)
 {
-    const CPUState *cpu = env_cpu((CPUArchState *)env);
+    const CPUState *cpu = env_cpu_const(env);
     const TaskState *ts = (const TaskState *)cpu->opaque;
     struct vm_area_struct *vma = NULL;
     g_autofree char *corefile = NULL;
