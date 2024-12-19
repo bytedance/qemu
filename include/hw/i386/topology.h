@@ -123,9 +123,11 @@ static inline unsigned apicid_pkg_offset(X86CPUTopoInfo *topo_info)
     return apicid_die_offset(topo_info) + apicid_die_width(topo_info);
 }
 
-/* Make APIC ID for the CPU based on Pkg_ID, Core_ID, SMT_ID
+/*
+ * Make APIC ID for the CPU based on topology and IDs of each topology level.
  *
- * The caller must make sure core_id < nr_cores and smt_id < nr_threads.
+ * The caller must make sure the ID of each level doesn't exceed the width of
+ * the level.
  */
 static inline apic_id_t x86_apicid_from_topo_ids(X86CPUTopoInfo *topo_info,
                                                  const X86CPUTopoIDs *topo_ids)
