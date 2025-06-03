@@ -2102,7 +2102,7 @@ struct ArchCPU {
     bool enable_cpuid_0xb;
 
     /* Force to enable cpuid 0x1f */
-    bool enable_cpuid_0x1f;
+    bool force_cpuid_0x1f;
 
     /* Enable auto level-increase for all CPUID leaves */
     bool full_cpuid_auto_level;
@@ -2325,7 +2325,7 @@ void host_cpuid(uint32_t function, uint32_t count,
 
 static inline bool x86_has_cpuid_0x1f(X86CPU *cpu)
 {
-    return cpu->enable_cpuid_0x1f ||
+    return cpu->force_cpuid_0x1f ||
            x86_has_extended_topo(cpu->env.avail_cpu_topo);
 }
 
