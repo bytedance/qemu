@@ -116,6 +116,7 @@
 
 GlobalProperty pc_compat_8_0[] = {
     { "virtio-mem", "unplugged-inaccessible", "auto" },
+    { TYPE_X86_CPU, "x-vendor-cpuid-only-v2", "false" },
 };
 const size_t pc_compat_8_0_len = G_N_ELEMENTS(pc_compat_8_0);
 
