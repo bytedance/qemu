@@ -2023,7 +2023,8 @@ int kvm_arch_init_vcpu(CPUState *cs)
         case 0x7:
         case 0x14:
         case 0x1d:
-        case 0x1e: {
+        case 0x1e:
+        case 0x24: {
             uint32_t times;
 
             c->function = i;
