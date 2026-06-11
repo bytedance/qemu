@@ -138,6 +138,20 @@ The ``-singlestep`` option has been given a name that better reflects
 what it actually does. For both linux-user and bsd-user, use the
 new ``-one-insn-per-tb`` option instead.
 
+``-smp`` (Unsupported "parameter=1" SMP configurations) (since 9.0)
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+Specified CPU topology parameters must be supported by the machine.
+
+In the SMP configuration, users should provide the CPU topology parameters that
+are supported by the target machine.
+
+However, historically it was allowed for users to specify the unsupported
+topology parameter as "1", which is meaningless. So support for this kind of
+configurations (e.g. -smp drawers=1,books=1,clusters=1 for x86 PC machine) is
+marked deprecated since 9.0, users have to ensure that all the topology members
+described with -smp are supported by the target machine.
+
 QEMU Machine Protocol (QMP) commands
 ------------------------------------
 
