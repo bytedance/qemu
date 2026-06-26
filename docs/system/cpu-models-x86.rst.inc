@@ -71,6 +71,36 @@ mixture of host CPU models between machines, if live migration
 compatibility is required, use the newest CPU model that is compatible
 across all desired hosts.
 
+``ClearwaterForest``
+    Intel Xeon Processor (ClearwaterForest, 2025)
+
+``SierraForest``, ``SierraForest-v2``
+    Intel Xeon Processor (SierraForest, 2024), SierraForest-v2 mitigates
+    the GDS and RFDS vulnerabilities with stepping 3.
+
+``GraniteRapids``, ``GraniteRapids-v2``
+    Intel Xeon Processor (GraniteRapids, 2024)
+
+``DiamondRapids``
+    Intel Xeon Processor.
+
+    Diamond Rapids product has a topology which differs from previous Xeon
+    products. It does not support SMT, but instead features a dual core
+    module (DCM) architecture. It also has core building blocks (CBB - die
+    level in CPU topology). The cache hierarchy is organized as follows:
+    L1 i/d cache is per thread, L2 cache is per DCM, and L3 cache is per
+    CBB. This cache topology can be emulated for DiamondRapids CPU model
+    using the smp-cache configuration as shown below:
+
+    Example:
+
+        ::
+
+            -machine smp-cache.0.cache=l1d,smp-cache.0.topology=thread,\
+                     smp-cache.1.cache=l1i,smp-cache.1.topology=thread,\
+                     smp-cache.2.cache=l2,smp-cache.2.topology=module,\
+                     smp-cache.3.cache=l3,smp-cache.3.topology=die
+
 ``Cascadelake-Server``, ``Cascadelake-Server-noTSX``
     Intel Xeon Processor (Cascade Lake, 2019), with "stepping" levels 6
     or 7 only.  (The Cascade Lake Xeon processor with *stepping 5 is
@@ -181,7 +211,7 @@ features are included if using "Host passthrough" or "Host model".
   CVE-2018-12127, [MSBDS] CVE-2018-12126).
 
   This is an MSR (Model-Specific Register) feature rather than a CPUID feature,
-  so it will not appear in the Linux ``/proc/cpuinfo`` in the host or
+  therefore it will not appear in the Linux ``/proc/cpuinfo`` in the host or
   guest.  Instead, the host kernel uses it to populate the MDS
   vulnerability file in ``sysfs``.
 
@@ -189,10 +219,10 @@ features are included if using "Host passthrough" or "Host model".
   affected} in the ``/sys/devices/system/cpu/vulnerabilities/mds`` file.
 
 ``taa-no``
-  Recommended to inform that the guest that the host is ``not``
+  Recommended to inform the guest that the host is ``not``
   vulnerable to CVE-2019-11135, TSX Asynchronous Abort (TAA).
 
-  This too is an MSR feature, so it does not show up in the Linux
+  This is also an MSR feature, therefore it does not show up in the Linux
   ``/proc/cpuinfo`` in the host or guest.
 
   It should only be enabled for VMs if the host reports ``Not affected``
@@ -214,7 +244,7 @@ features are included if using "Host passthrough" or "Host model".
   By disabling TSX, KVM-based guests can avoid paying the price of
   mitigating TSX-based attacks.
 
-  Note that ``tsx-ctrl`` too is an MSR feature, so it does not show
+  Note that ``tsx-ctrl`` is also an MSR feature, therefore it does not show
   up in the Linux ``/proc/cpuinfo`` in the host or guest.
 
   To validate that Intel TSX is indeed disabled for the guest, there are
@@ -223,6 +253,38 @@ features are included if using "Host passthrough" or "Host model".
   ``/sys/devices/system/cpu/vulnerabilities/tsx_async_abort`` file in
   the guest should report ``Mitigation: TSX disabled``.
 
+``bhi-no``
+  Recommended to inform the guest that the host is ``not``
+  vulnerable to CVE-2022-0001, Branch History Injection (BHI).
+
+  This is also an MSR feature, therefore it does not show up in the Linux
+  ``/proc/cpuinfo`` in the host or guest.
+
+  It should only be enabled for VMs if the host reports
+  ``BHI: Not affected`` in the
+  ``/sys/devices/system/cpu/vulnerabilities/spectre_v2`` file.
+
+``gds-no``
+  Recommended to inform the guest that the host is ``not``
+  vulnerable to CVE-2022-40982, Gather Data Sampling (GDS).
+
+  This is also an MSR feature, therefore it does not show up in the Linux
+  ``/proc/cpuinfo`` in the host or guest.
+
+  It should only be enabled for VMs if the host reports ``Not affected``
+  in the ``/sys/devices/system/cpu/vulnerabilities/gather_data_sampling``
+  file.
+
+``rfds-no``
+  Recommended to inform the guest that the host is ``not``
+  vulnerable to CVE-2023-28746, Register File Data Sampling (RFDS).
+
+  This is also an MSR feature, therefore it does not show up in the Linux
+  ``/proc/cpuinfo`` in the host or guest.
+
+  It should only be enabled for VMs if the host reports ``Not affected``
+  in the ``/sys/devices/system/cpu/vulnerabilities/reg_file_data_sampling``
+  file.
 
 Preferred CPU models for AMD x86 hosts
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

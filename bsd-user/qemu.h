@@ -37,6 +37,7 @@ extern char **environ;
 #include "target.h"
 #include "exec/gdbstub.h"
 #include "qemu/clang-tsa.h"
+#include "accel/tcg/vcpu-state.h"
 
 /*
  * This struct is used to hold certain information about the image.  Basically,
@@ -72,7 +73,7 @@ struct emulated_sigtable {
 /*
  * NOTE: we force a big alignment so that the stack stored after is aligned too
  */
-typedef struct TaskState {
+struct TaskState {
     pid_t ts_tid;     /* tid (or pid) of this task */
 
     struct TaskState *next;
@@ -110,7 +111,7 @@ typedef struct TaskState {
 
     /* This thread's sigaltstack, if it has one */
     struct target_sigaltstack sigaltstack_used;
-} __attribute__((aligned(16))) TaskState;
+} __attribute__((aligned(16)));
 
 void stop_all_tasks(void);
 extern const char *qemu_uname_release;

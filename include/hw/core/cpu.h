@@ -22,9 +22,10 @@
 
 #include "hw/qdev-core.h"
 #include "disas/dis-asm.h"
-#include "exec/cpu-common.h"
 #include "exec/hwaddr.h"
+#include "exec/vaddr.h"
 #include "exec/memattrs.h"
+#include "exec/tlb-common.h"
 #include "qapi/qapi-types-run-state.h"
 #include "qemu/bitmap.h"
 #include "qemu/rcu_queue.h"
@@ -193,6 +194,125 @@ struct CPUClass {
 };
 
 /*
+ * Fix the number of mmu modes to 16, which is also the maximum
+ * supported by the softmmu tlb api.
+ */
+#define NB_MMU_MODES 16
+
+/* Use a fully associative victim tlb of 8 entries. */
+#define CPU_VTLB_SIZE 8
+
+/*
+ * The full TLB entry, which is not accessed by generated TCG code,
+ * so the layout is not as critical as that of CPUTLBEntry. This is
+ * also why we don't want to combine the two structs.
+ */
+typedef struct CPUTLBEntryFull {
+    /*
+     * @xlat_section contains:
+     *  - in the lower TARGET_PAGE_BITS, a physical section number
+     *  - with the lower TARGET_PAGE_BITS masked off, an offset which
+     *    must be added to the virtual address to obtain:
+     *     + the ram_addr_t of the target RAM (if the physical section
+     *       number is PHYS_SECTION_NOTDIRTY or PHYS_SECTION_ROM)
+     *     + the offset within the target MemoryRegion (otherwise)
+     */
+    hwaddr xlat_section;
+
+    /*
+     * @phys_addr contains the physical address in the address space
+     * given by cpu_asidx_from_attrs(cpu, @attrs).
+     */
+    hwaddr phys_addr;
+
+    /* @attrs contains the memory transaction attributes for the page. */
+    MemTxAttrs attrs;
+
+    /* @prot contains the complete protections for the page. */
+    uint8_t prot;
+
+    /* @lg_page_size contains the log2 of the page size. */
+    uint8_t lg_page_size;
+
+    /*
+     * Additional tlb flags for use by the slow path. If non-zero,
+     * the corresponding CPUTLBEntry comparator must have TLB_FORCE_SLOW.
+     */
+    uint8_t slow_flags[MMU_ACCESS_COUNT];
+
+    /*
+     * Allow target-specific additions to this structure.
+     * This may be used to cache items from the guest cpu
+     * page tables for later use by the implementation.
+     */
+#ifdef TARGET_PAGE_ENTRY_EXTRA
+    TARGET_PAGE_ENTRY_EXTRA
+#endif
+} CPUTLBEntryFull;
+
+/*
+ * Data elements that are per MMU mode, minus the bits accessed by
+ * the TCG fast path.
+ */
+typedef struct CPUTLBDesc {
+    /*
+     * Describe a region covering all of the large pages allocated
+     * into the tlb.  When any page within this region is flushed,
+     * we must flush the entire tlb.  The region is matched if
+     * (addr & large_page_mask) == large_page_addr.
+     */
+    vaddr large_page_addr;
+    vaddr large_page_mask;
+    /* host time (in ns) at the beginning of the time window */
+    int64_t window_begin_ns;
+    /* maximum number of entries observed in the window */
+    size_t window_max_entries;
+    size_t n_used_entries;
+    /* The next index to use in the tlb victim table.  */
+    size_t vindex;
+    /* The tlb victim table, in two parts.  */
+    CPUTLBEntry vtable[CPU_VTLB_SIZE];
+    CPUTLBEntryFull vfulltlb[CPU_VTLB_SIZE];
+    CPUTLBEntryFull *fulltlb;
+} CPUTLBDesc;
+
+/*
+ * Data elements that are shared between all MMU modes.
+ */
+typedef struct CPUTLBCommon {
+    /* Serialize updates to f.table and d.vtable, and others as noted. */
+    QemuSpin lock;
+    /*
+     * Within dirty, for each bit N, modifications have been made to
+     * mmu_idx N since the last time that mmu_idx was flushed.
+     * Protected by tlb_c.lock.
+     */
+    uint16_t dirty;
+    /*
+     * Statistics.  These are not lock protected, but are read and
+     * written atomically.  This allows the monitor to print a snapshot
+     * of the stats without interfering with the cpu.
+     */
+    size_t full_flush_count;
+    size_t part_flush_count;
+    size_t elide_flush_count;
+} CPUTLBCommon;
+
+/*
+ * The entire softmmu tlb, for all MMU modes.
+ * The meaning of each of the MMU modes is defined in the target code.
+ * Since this is placed within CPUNegativeOffsetState, the smallest
+ * negative offsets are at the end of the struct.
+ */
+typedef struct CPUTLB {
+#ifdef CONFIG_TCG
+    CPUTLBCommon c;
+    CPUTLBDesc d[NB_MMU_MODES];
+    CPUTLBDescFast f[NB_MMU_MODES];
+#endif
+} CPUTLB;
+
+/*
  * Low 16 bits: number of cycles left, used only in icount mode.
  * High 16 bits: Set to -1 to force TCG to stop executing linked TBs
  * for this CPU and return to its top level loop (even in non-icount mode).
@@ -211,6 +331,15 @@ typedef union IcountDecr {
 #endif
     } u16;
 } IcountDecr;
+
+/*
+ * Elements of CPUState most efficiently accessed from CPUArchState,
+ * via small negative offsets.
+ */
+typedef struct CPUNegativeOffsetState {
+    CPUTLB tlb;
+    IcountDecr icount_decr;
+} CPUNegativeOffsetState;
 
 typedef struct CPUBreakpoint {
     vaddr pc;
@@ -276,8 +405,7 @@ struct qemu_work_item;
  *   Under TCG this value is propagated to @tcg_cflags.
  *   See TranslationBlock::TCG CF_CLUSTER_MASK.
  * @tcg_cflags: Pre-computed cflags for this cpu.
- * @nr_cores: Number of cores within this CPU package.
- * @nr_threads: Number of threads within this CPU.
+ * @nr_threads: Number of threads within this CPU core.
  * @running: #true if CPU is currently running (lockless).
  * @has_waiter: #true if a CPU is currently waiting for the cpu_exec_end;
  * valid under cpu_list_lock.
@@ -323,6 +451,9 @@ struct qemu_work_item;
  *    dirty ring structure.
  *
  * State of one CPU core or thread.
+ *
+ * Align, in order to match possible alignment required by CPUArchState,
+ * and eliminate a hole between CPUState and CPUArchState within ArchCPU.
  */
 struct CPUState {
     /*< private >*/
@@ -331,7 +462,6 @@ struct CPUState {
     CPUClass *cc;
     /*< public >*/
 
-    int nr_cores;
     int nr_threads;
 
     struct QemuThread *thread;
@@ -443,7 +573,17 @@ struct CPUState {
 
     /* track IOMMUs whose translations we've cached in the TCG TLB */
     GArray *iommu_notifiers;
+
+    /*
+     * MUST BE LAST in order to minimize the displacement to CPUArchState.
+     */
+    char neg_align[-sizeof(CPUNegativeOffsetState) % 16] QEMU_ALIGNED(16);
+    CPUNegativeOffsetState neg;
 };
+
+/* Validate placement of CPUNegativeOffsetState. */
+QEMU_BUILD_BUG_ON(offsetof(CPUState, neg) !=
+                  sizeof(CPUState) - sizeof(CPUNegativeOffsetState));
 
 typedef QTAILQ_HEAD(CPUTailQ, CPUState) CPUTailQ;
 extern CPUTailQ cpus;

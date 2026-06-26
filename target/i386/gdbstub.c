@@ -18,13 +18,20 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "accel/tcg/vcpu-state.h"
 #include "cpu.h"
-#include "include/gdbstub/helpers.h"
+#include "exec/gdbstub.h"
+#include "gdbstub/helpers.h"
+#ifdef CONFIG_LINUX_USER
+#include "linux-user/qemu.h"
+#endif
 
 #ifdef TARGET_X86_64
-static const int gpr_map[16] = {
+static const int gpr_map[CPU_NB_EREGS] = {
     R_EAX, R_EBX, R_ECX, R_EDX, R_ESI, R_EDI, R_EBP, R_ESP,
-    8, 9, 10, 11, 12, 13, 14, 15
+    R_R8, R_R9, R_R10, R_R11, R_R12, R_R13, R_R14, R_R15,
+    R_R16, R_R17, R_R18, R_R19, R_R20, R_R21, R_R22, R_R23,
+    R_R24, R_R25, R_R26, R_R27, R_R28, R_R29, R_R30, R_R31,
 };
 #else
 #define gpr_map gpr_map32
@@ -96,6 +103,19 @@ static int gdb_write_reg_cs64(uint32_t hflags, uint8_t *buf, target_ulong *val)
     return 4;
 }
 
+static int gdb_get_reg(CPUX86State *env, GByteArray *mem_buf, target_ulong val)
+{
+    if (TARGET_LONG_BITS == 64) {
+        if (env->hflags & HF_CS64_MASK) {
+            return gdb_get_reg64(mem_buf, val);
+        } else {
+            return gdb_get_reg64(mem_buf, val & 0xffffffffUL);
+        }
+    } else {
+        return gdb_get_reg32(mem_buf, val);
+    }
+}
+
 int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
 {
     X86CPU *cpu = X86_CPU(cs);
@@ -137,15 +157,7 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
     } else {
         switch (n) {
         case IDX_IP_REG:
-            if (TARGET_LONG_BITS == 64) {
-                if (env->hflags & HF_CS64_MASK) {
-                    return gdb_get_reg64(mem_buf, env->eip);
-                } else {
-                    return gdb_get_reg64(mem_buf, env->eip & 0xffffffffUL);
-                }
-            } else {
-                return gdb_get_reg32(mem_buf, env->eip);
-            }
+            return gdb_get_reg(env, mem_buf, env->eip);
         case IDX_FLAGS_REG:
             return gdb_get_reg32(mem_buf, env->eflags);
 
@@ -248,6 +260,21 @@ static int x86_cpu_gdb_load_seg(X86CPU *cpu, X86Seg sreg, uint8_t *mem_buf)
     return 4;
 }
 
+static int gdb_write_reg(CPUX86State *env, uint8_t *mem_buf, target_ulong *val)
+{
+    if (TARGET_LONG_BITS == 64) {
+        if (env->hflags & HF_CS64_MASK) {
+            *val = ldq_p(mem_buf);
+        } else {
+            *val = ldq_p(mem_buf) & 0xffffffffUL;
+        }
+        return 8;
+    } else {
+        *val = (uint32_t)ldl_p(mem_buf);
+        return 4;
+    }
+}
+
 int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
 {
     X86CPU *cpu = X86_CPU(cs);
@@ -288,18 +315,7 @@ int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
     } else {
         switch (n) {
         case IDX_IP_REG:
-            if (TARGET_LONG_BITS == 64) {
-                if (env->hflags & HF_CS64_MASK) {
-                    env->eip = ldq_p(mem_buf);
-                } else {
-                    env->eip = ldq_p(mem_buf) & 0xffffffffUL;
-                }
-                return 8;
-            } else {
-                env->eip &= ~0xffffffffUL;
-                env->eip |= (uint32_t)ldl_p(mem_buf);
-                return 4;
-            }
+            return gdb_write_reg(env, mem_buf, &env->eip);
         case IDX_FLAGS_REG:
             env->eflags = ldl_p(mem_buf);
             return 4;
@@ -396,4 +412,115 @@ int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
     }
     /* Unrecognised register.  */
     return 0;
+}
+
+#ifdef CONFIG_LINUX_USER
+
+#define IDX_ORIG_AX 0
+
+static int x86_cpu_gdb_read_linux_register(CPUState *cs, GByteArray *mem_buf,
+                                           int n)
+{
+    X86CPU *cpu = X86_CPU(cs);
+    CPUX86State *env = &cpu->env;
+
+    switch (n) {
+    case IDX_ORIG_AX:
+        return gdb_get_reg(env, mem_buf, get_task_state(cs)->orig_ax);
+    }
+    return 0;
+}
+
+static int x86_cpu_gdb_write_linux_register(CPUState *cs, uint8_t *mem_buf,
+                                            int n)
+{
+    X86CPU *cpu = X86_CPU(cs);
+    CPUX86State *env = &cpu->env;
+
+    switch (n) {
+    case IDX_ORIG_AX:
+        return gdb_write_reg(env, mem_buf, &get_task_state(cs)->orig_ax);
+    }
+    return 0;
+}
+
+#endif
+
+#ifdef TARGET_X86_64
+static int i386_cpu_gdb_get_egprs(CPUState *cs, GByteArray *mem_buf, int n)
+{
+    CPUX86State *env = &X86_CPU(cs)->env;
+
+    if (n >= 0 && n < EGPR_NUM) {
+        /* EGPRs can be only directly accessible in 64-bit mode. */
+        if (env->hflags & HF_CS64_MASK) {
+            return gdb_get_reg64(mem_buf, env->regs[gpr_map[n + CPU_NB_REGS]]);
+        } else {
+            return gdb_get_regl(mem_buf, 0);
+        }
+    }
+
+    return 0;
+}
+
+static int i386_cpu_gdb_set_egprs(CPUState *cs, uint8_t *mem_buf, int n)
+{
+    CPUX86State *env = &X86_CPU(cs)->env;
+
+    if (n >= 0 && n < EGPR_NUM) {
+        /*
+         * EGPRs can be only directly accessible in 64-bit mode, and require
+         * XCR0[APX_F] (at least for modification in gdbstub) to be enabled.
+         */
+        if (env->hflags & HF_CS64_MASK && env->xcr0 & XSTATE_APX_MASK) {
+            env->regs[gpr_map[n + CPU_NB_REGS]] = ldtul_p(mem_buf);
+
+            /*
+             * Per SDM Vol 1, "Processor Tracking of XSAVE-Managed State",
+             * XSTATE_BV[i] *may* be either 0 or 1 if the state component is
+             * in its initial configuration.
+             *
+             * However, it is observed on Diamond Rapids (DMR) that
+             * XSTATE_BV[APX_F] is set whenever EGPRs are modified, regardless
+             * of the value written (even if zero).
+             *
+             * Since GDB modifies the software register cache directly,
+             * manually force the bit set to emulate this behavior observed
+             * on hardware.
+             */
+            if (!(env->xstate_bv & XSTATE_APX_MASK)) {
+                env->xstate_bv |= XSTATE_APX_MASK;
+            }
+        }
+        return sizeof(target_ulong);
+    }
+    return 0;
+}
+#endif
+
+void x86_cpu_gdb_init(CPUState *cs)
+{
+#ifdef TARGET_X86_64
+    CPUX86State *env = &X86_CPU(cs)->env;
+
+    if (env->features[FEAT_7_1_EDX] & CPUID_7_1_EDX_APXF) {
+        gdb_register_coprocessor(cs, i386_cpu_gdb_get_egprs,
+                                 i386_cpu_gdb_set_egprs,
+                                 16,
+                                 "i386-64bit-apx.xml",
+                                 0);
+    }
+#endif
+
+#ifdef CONFIG_LINUX_USER
+    gdb_register_coprocessor(cs, x86_cpu_gdb_read_linux_register,
+                             x86_cpu_gdb_write_linux_register,
+                             1,
+#ifdef TARGET_X86_64
+                             "i386-64bit-linux.xml",
+#else
+                             "i386-32bit-linux.xml",
+#endif
+                             0);
+#endif
 }

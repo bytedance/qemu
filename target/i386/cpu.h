@@ -24,6 +24,7 @@
 #include "cpu-qom.h"
 #include "kvm/hyperv-proto.h"
 #include "exec/cpu-defs.h"
+#include "hw/i386/topology.h"
 #include "qapi/qapi-types-common.h"
 #include "qemu/cpu-float.h"
 #include "qemu/timer.h"
@@ -64,6 +65,22 @@ enum {
     R_R13 = 13,
     R_R14 = 14,
     R_R15 = 15,
+    R_R16 = 16,
+    R_R17 = 17,
+    R_R18 = 18,
+    R_R19 = 19,
+    R_R20 = 20,
+    R_R21 = 21,
+    R_R22 = 22,
+    R_R23 = 23,
+    R_R24 = 24,
+    R_R25 = 25,
+    R_R26 = 26,
+    R_R27 = 27,
+    R_R28 = 28,
+    R_R29 = 29,
+    R_R30 = 30,
+    R_R31 = 31,
 
     R_AL = 0,
     R_CL = 1,
@@ -263,6 +280,12 @@ typedef enum X86Seg {
 #define CR4_PKS_MASK   (1U << 24)
 #define CR4_LAM_SUP_MASK (1U << 28)
 
+#ifdef TARGET_X86_64
+#define CR4_FRED_MASK   (1ULL << 32)
+#else
+#define CR4_FRED_MASK   0
+#endif
+
 #define CR4_RESERVED_MASK \
 (~(target_ulong)(CR4_VME_MASK | CR4_PVI_MASK | CR4_TSD_MASK \
                 | CR4_DE_MASK | CR4_PSE_MASK | CR4_PAE_MASK \
@@ -271,7 +294,7 @@ typedef enum X86Seg {
                 | CR4_LA57_MASK \
                 | CR4_FSGSBASE_MASK | CR4_PCIDE_MASK | CR4_OSXSAVE_MASK \
                 | CR4_SMEP_MASK | CR4_SMAP_MASK | CR4_PKE_MASK | CR4_PKS_MASK \
-                | CR4_LAM_SUP_MASK))
+                | CR4_LAM_SUP_MASK | CR4_FRED_MASK))
 
 #define DR6_BD          (1 << 13)
 #define DR6_BS          (1 << 14)
@@ -524,6 +547,17 @@ typedef enum X86Seg {
 #define MSR_IA32_XFD                    0x000001c4
 #define MSR_IA32_XFD_ERR                0x000001c5
 
+/* FRED MSRs */
+#define MSR_IA32_FRED_RSP0              0x000001cc       /* Stack level 0 regular stack pointer */
+#define MSR_IA32_FRED_RSP1              0x000001cd       /* Stack level 1 regular stack pointer */
+#define MSR_IA32_FRED_RSP2              0x000001ce       /* Stack level 2 regular stack pointer */
+#define MSR_IA32_FRED_RSP3              0x000001cf       /* Stack level 3 regular stack pointer */
+#define MSR_IA32_FRED_STKLVLS           0x000001d0       /* FRED exception stack levels */
+#define MSR_IA32_FRED_SSP1              0x000001d1       /* Stack level 1 shadow stack pointer in ring 0 */
+#define MSR_IA32_FRED_SSP2              0x000001d2       /* Stack level 2 shadow stack pointer in ring 0 */
+#define MSR_IA32_FRED_SSP3              0x000001d3       /* Stack level 3 shadow stack pointer in ring 0 */
+#define MSR_IA32_FRED_CONFIG            0x000001d4       /* FRED Entrypoint and interrupt stack level */
+
 #define MSR_IA32_BNDCFGS                0x00000d90
 #define MSR_IA32_XSS                    0x00000da0
 #define MSR_IA32_UMWAIT_CONTROL         0xe1
@@ -559,6 +593,7 @@ typedef enum X86Seg {
 #define XSTATE_ARCH_LBR_BIT             15
 #define XSTATE_XTILE_CFG_BIT            17
 #define XSTATE_XTILE_DATA_BIT           18
+#define XSTATE_APX_BIT                  19
 
 #define XSTATE_FP_MASK                  (1ULL << XSTATE_FP_BIT)
 #define XSTATE_SSE_MASK                 (1ULL << XSTATE_SSE_BIT)
@@ -572,6 +607,7 @@ typedef enum X86Seg {
 #define XSTATE_ARCH_LBR_MASK            (1ULL << XSTATE_ARCH_LBR_BIT)
 #define XSTATE_XTILE_CFG_MASK           (1ULL << XSTATE_XTILE_CFG_BIT)
 #define XSTATE_XTILE_DATA_MASK          (1ULL << XSTATE_XTILE_DATA_BIT)
+#define XSTATE_APX_MASK                 (1ULL << XSTATE_APX_BIT)
 
 #define XSTATE_DYNAMIC_MASK             (XSTATE_XTILE_DATA_MASK)
 
@@ -588,7 +624,8 @@ typedef enum X86Seg {
                                  XSTATE_BNDCSR_MASK | XSTATE_OPMASK_MASK | \
                                  XSTATE_ZMM_Hi256_MASK | \
                                  XSTATE_Hi16_ZMM_MASK | XSTATE_PKRU_MASK | \
-                                 XSTATE_XTILE_CFG_MASK | XSTATE_XTILE_DATA_MASK)
+                                 XSTATE_XTILE_CFG_MASK | \
+                                 XSTATE_XTILE_DATA_MASK | XSTATE_APX_MASK)
 
 /* CPUID feature words */
 typedef enum FeatureWord {
@@ -600,6 +637,7 @@ typedef enum FeatureWord {
     FEAT_7_1_EAX,       /* CPUID[EAX=7,ECX=1].EAX */
     FEAT_8000_0001_EDX, /* CPUID[8000_0001].EDX */
     FEAT_8000_0001_ECX, /* CPUID[8000_0001].ECX */
+    FEAT_8000_0007_EBX, /* CPUID[8000_0007].EBX */
     FEAT_8000_0007_EDX, /* CPUID[8000_0007].EDX */
     FEAT_8000_0008_EBX, /* CPUID[8000_0008].EBX */
     FEAT_8000_0021_EAX, /* CPUID[8000_0021].EAX */
@@ -631,12 +669,15 @@ typedef enum FeatureWord {
     FEAT_XSAVE_XSS_HI,     /* CPUID[EAX=0xd,ECX=1].EDX */
     FEAT_7_1_EDX,       /* CPUID[EAX=7,ECX=1].EDX */
     FEAT_7_2_EDX,       /* CPUID[EAX=7,ECX=2].EDX */
+    FEAT_24_0_EBX,      /* CPUID[EAX=0x24,ECX=0].EBX */
+    FEAT_29_0_EBX,      /* CPUID[EAX=0x29,ECX=0].EBX */
+    FEAT_1E_1_EAX,      /* CPUID[EAX=0x1E,ECX=1].EAX */
+    FEAT_24_1_ECX,      /* CPUID[EAX=0x24,ECX=0].ECX */
     FEATURE_WORDS,
 } FeatureWord;
 
 typedef uint64_t FeatureWordArray[FEATURE_WORDS];
-uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
-                                            bool migratable_only);
+uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 
 /* cpuid_features bits */
 #define CPUID_FP87 (1U << 0)
@@ -782,6 +823,8 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 
 /* Support RDFSBASE/RDGSBASE/WRFSBASE/WRGSBASE */
 #define CPUID_7_0_EBX_FSGSBASE          (1U << 0)
+/* Support TSC adjust MSR */
+#define CPUID_7_0_EBX_TSC_ADJUST        (1U << 1)
 /* Support SGX */
 #define CPUID_7_0_EBX_SGX               (1U << 2)
 /* 1st Group of Advanced Bit Manipulation Extensions */
@@ -790,6 +833,8 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define CPUID_7_0_EBX_HLE               (1U << 4)
 /* Intel Advanced Vector Extensions 2 */
 #define CPUID_7_0_EBX_AVX2              (1U << 5)
+/* FPU data pointer updated only on x87 exceptions */
+#define CPUID_7_0_EBX_FDP_EXCPTN_ONLY (1u << 6)
 /* Supervisor-mode Execution Prevention */
 #define CPUID_7_0_EBX_SMEP              (1U << 7)
 /* 2nd Group of Advanced Bit Manipulation Extensions */
@@ -800,6 +845,8 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define CPUID_7_0_EBX_INVPCID           (1U << 10)
 /* Restricted Transactional Memory */
 #define CPUID_7_0_EBX_RTM               (1U << 11)
+/* Zero out FPU CS and FPU DS */
+#define CPUID_7_0_EBX_ZERO_FCS_FDS      (1U << 13)
 /* Memory Protection Extension */
 #define CPUID_7_0_EBX_MPX               (1U << 14)
 /* AVX-512 Foundation */
@@ -911,6 +958,12 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 /* Speculative Store Bypass Disable */
 #define CPUID_7_0_EDX_SPEC_CTRL_SSBD    (1U << 31)
 
+/* SHA512 Instruction */
+#define CPUID_7_1_EAX_SHA512            (1U << 0)
+/* SM3 Instruction */
+#define CPUID_7_1_EAX_SM3               (1U << 1)
+/* SM4 Instruction */
+#define CPUID_7_1_EAX_SM4               (1U << 2)
 /* AVX VNNI Instruction */
 #define CPUID_7_1_EAX_AVX_VNNI          (1U << 4)
 /* AVX512 BFloat16 Instruction */
@@ -923,20 +976,46 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define CPUID_7_1_EAX_FSRS              (1U << 11)
 /* Fast Short REP CMPS/SCAS */
 #define CPUID_7_1_EAX_FSRC              (1U << 12)
+/* Flexible return and event delivery (FRED) */
+#define CPUID_7_1_EAX_FRED              (1U << 17)
+/* Load into IA32_KERNEL_GS_BASE (LKGS) */
+#define CPUID_7_1_EAX_LKGS              (1U << 18)
+/* Non-Serializing Write to Model Specific Register (WRMSRNS) */
+#define CPUID_7_1_EAX_WRMSRNS           (1U << 19)
 /* Support Tile Computational Operations on FP16 Numbers */
 #define CPUID_7_1_EAX_AMX_FP16          (1U << 21)
 /* Support for VPMADD52[H,L]UQ */
 #define CPUID_7_1_EAX_AVX_IFMA          (1U << 23)
 /* Linear Address Masking */
 #define CPUID_7_1_EAX_LAM               (1U << 26)
+/* MOVRS Instructions */
+#define CPUID_7_1_EAX_MOVRS             (1U << 31)
 
 /* Support for VPDPB[SU,UU,SS]D[,S] */
 #define CPUID_7_1_EDX_AVX_VNNI_INT8     (1U << 4)
 /* AVX NE CONVERT Instructions */
 #define CPUID_7_1_EDX_AVX_NE_CONVERT    (1U << 5)
+/* AMX COMPLEX Instructions */
+#define CPUID_7_1_EDX_AMX_COMPLEX       (1U << 8)
+/* AVX-VNNI-INT16 Instructions */
+#define CPUID_7_1_EDX_AVX_VNNI_INT16    (1U << 10)
 /* PREFETCHIT0/1 Instructions */
 #define CPUID_7_1_EDX_PREFETCHITI       (1U << 14)
+/* Support for Advanced Vector Extensions 10 */
+#define CPUID_7_1_EDX_AVX10             (1U << 19)
+/* Support for Advanced Performance Extensions  */
+#define CPUID_7_1_EDX_APXF               (1U << 21)
 
+/* Indicate bit 7 of the IA32_SPEC_CTRL MSR is supported */
+#define CPUID_7_2_EDX_PSFD              (1U << 0)
+/* Indicate bits 3 and 4 of the IA32_SPEC_CTRL MSR are supported */
+#define CPUID_7_2_EDX_IPRED_CTRL        (1U << 1)
+/* Indicate bits 5 and 6 of the IA32_SPEC_CTRL MSR are supported */
+#define CPUID_7_2_EDX_RRSBA_CTRL        (1U << 2)
+/* Indicate bit 8 of the IA32_SPEC_CTRL MSR is supported */
+#define CPUID_7_2_EDX_DDPD_U            (1U << 3)
+/* Indicate bit 10 of the IA32_SPEC_CTRL MSR is supported */
+#define CPUID_7_2_EDX_BHI_CTRL          (1U << 4)
 /* Do not exhibit MXCSR Configuration Dependent Timing (MCDT) behavior */
 #define CPUID_7_2_EDX_MCDT_NO           (1U << 5)
 
@@ -946,6 +1025,46 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 /* Packets which contain IP payload have LIP values */
 #define CPUID_14_0_ECX_LIP              (1U << 31)
 
+/* AMX_INT8 instruction (mirror of CPUID_7_0_EDX_AMX_INT8) */
+#define CPUID_1E_1_EAX_AMX_INT8_MIRROR      (1U << 0)
+/* AMX_BF16 instruction (mirror of CPUID_7_0_EDX_AMX_BF16) */
+#define CPUID_1E_1_EAX_AMX_BF16_MIRROR      (1U << 1)
+/* AMX_COMPLEX instruction (mirror of CPUID_7_1_EDX_AMX_COMPLEX) */
+#define CPUID_1E_1_EAX_AMX_COMPLEX_MIRROR   (1U << 2)
+/* AMX_FP16 instruction (mirror of CPUID_7_1_EAX_AMX_FP16) */
+#define CPUID_1E_1_EAX_AMX_FP16_MIRROR      (1U << 3)
+/* AMX_FP8 instruction */
+#define CPUID_1E_1_EAX_AMX_FP8              (1U << 4)
+/* AMX_TF32 instruction */
+#define CPUID_1E_1_EAX_AMX_TF32             (1U << 6)
+/* AMX_AVX512 instruction */
+#define CPUID_1E_1_EAX_AMX_AVX512           (1U << 7)
+/* AMX_MOVRS instruction */
+#define CPUID_1E_1_EAX_AMX_MOVRS            (1U << 8)
+
+/* AVX10 128-bit vector support is present */
+#define CPUID_24_0_EBX_AVX10_128        (1U << 16)
+/* AVX10 256-bit vector support is present */
+#define CPUID_24_0_EBX_AVX10_256        (1U << 17)
+/* AVX10 512-bit vector support is present */
+#define CPUID_24_0_EBX_AVX10_512        (1U << 18)
+/* AVX10 vector length support mask */
+#define CPUID_24_0_EBX_AVX10_VL_MASK    (CPUID_24_0_EBX_AVX10_128 | \
+                                         CPUID_24_0_EBX_AVX10_256 | \
+                                         CPUID_24_0_EBX_AVX10_512)
+
+/* AVX10_VNNI_INT instruction */
+#define CPUID_24_1_ECX_AVX10_VNNI_INT         (1U << 2)
+
+/*
+ * New Conditional Instructions (NCIs), explicit New Data Destination (NDD)
+ * controls, and explicit Flags Suppression (NF) controls for select sets of
+ * EVEX-encoded Intel APX instructions
+ */
+#define CPUID_29_0_EBX_APX_NCI_NDD_NF         (1U << 0)
+
+/* RAS Features */
+#define CPUID_8000_0007_EBX_SUCCOR      (1U << 1)
 /* CLZERO instruction */
 #define CPUID_8000_0008_EBX_CLZERO      (1U << 0)
 /* Always save/restore FP error pointers */
@@ -1011,10 +1130,16 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define CPUID_MWAIT_EMX     (1U << 0) /* enumeration supported */
 
 /* CPUID[0xB].ECX level types */
-#define CPUID_TOPOLOGY_LEVEL_INVALID  (0U << 8)
-#define CPUID_TOPOLOGY_LEVEL_SMT      (1U << 8)
-#define CPUID_TOPOLOGY_LEVEL_CORE     (2U << 8)
-#define CPUID_TOPOLOGY_LEVEL_DIE      (5U << 8)
+#define CPUID_B_ECX_TOPO_LEVEL_INVALID  0
+#define CPUID_B_ECX_TOPO_LEVEL_SMT      1
+#define CPUID_B_ECX_TOPO_LEVEL_CORE     2
+
+/* COUID[0x1F].ECX level types */
+#define CPUID_1F_ECX_TOPO_LEVEL_INVALID  CPUID_B_ECX_TOPO_LEVEL_INVALID
+#define CPUID_1F_ECX_TOPO_LEVEL_SMT      CPUID_B_ECX_TOPO_LEVEL_SMT
+#define CPUID_1F_ECX_TOPO_LEVEL_CORE     CPUID_B_ECX_TOPO_LEVEL_CORE
+#define CPUID_1F_ECX_TOPO_LEVEL_MODULE   3
+#define CPUID_1F_ECX_TOPO_LEVEL_DIE      5
 
 /* MSR Feature Bits */
 #define MSR_ARCH_CAP_RDCL_NO            (1U << 0)
@@ -1030,7 +1155,10 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define MSR_ARCH_CAP_FBSDP_NO           (1U << 14)
 #define MSR_ARCH_CAP_PSDP_NO            (1U << 15)
 #define MSR_ARCH_CAP_FB_CLEAR           (1U << 17)
+#define MSR_ARCH_CAP_BHI_NO             (1U << 20)
 #define MSR_ARCH_CAP_PBRSB_NO           (1U << 24)
+#define MSR_ARCH_CAP_GDS_NO             (1U << 26)
+#define MSR_ARCH_CAP_RFDS_NO            (1U << 27)
 
 #define MSR_CORE_CAP_SPLIT_LOCK_DETECT  (1U << 5)
 
@@ -1041,6 +1169,8 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define MSR_VMX_BASIC_DUAL_MONITOR                   (1ULL << 49)
 #define MSR_VMX_BASIC_INS_OUTS                       (1ULL << 54)
 #define MSR_VMX_BASIC_TRUE_CTLS                      (1ULL << 55)
+#define MSR_VMX_BASIC_ANY_ERRCODE                    (1ULL << 56)
+#define MSR_VMX_BASIC_NESTED_EXCEPTION               (1ULL << 58)
 
 #define MSR_VMX_MISC_PREEMPTION_TIMER_SHIFT_MASK     0x1Full
 #define MSR_VMX_MISC_STORE_LMA                       (1ULL << 5)
@@ -1115,6 +1245,7 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define VMX_SECONDARY_EXEC_ENABLE_PML               0x00020000
 #define VMX_SECONDARY_EXEC_XSAVES                   0x00100000
 #define VMX_SECONDARY_EXEC_TSC_SCALING              0x02000000
+#define VMX_SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE   0x04000000
 
 #define VMX_PIN_BASED_EXT_INTR_MASK                 0x00000001
 #define VMX_PIN_BASED_NMI_EXITING                   0x00000008
@@ -1135,6 +1266,7 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define VMX_VM_EXIT_PT_CONCEAL_PIP                  0x01000000
 #define VMX_VM_EXIT_CLEAR_IA32_RTIT_CTL             0x02000000
 #define VMX_VM_EXIT_LOAD_IA32_PKRS                  0x20000000
+#define VMX_VM_EXIT_ACTIVATE_SECONDARY_CONTROLS     0x80000000
 
 #define VMX_VM_ENTRY_LOAD_DEBUG_CONTROLS            0x00000004
 #define VMX_VM_ENTRY_IA32E_MODE                     0x00000200
@@ -1147,6 +1279,7 @@ uint64_t x86_cpu_get_supported_feature_word(FeatureWord w,
 #define VMX_VM_ENTRY_PT_CONCEAL_PIP                 0x00020000
 #define VMX_VM_ENTRY_LOAD_IA32_RTIT_CTL             0x00040000
 #define VMX_VM_ENTRY_LOAD_IA32_PKRS                 0x00400000
+#define VMX_VM_ENTRY_LOAD_IA32_FRED                 0x00800000
 
 /* Supported Hyper-V Enlightenments */
 #define HYPERV_FEAT_RELAXED             0
@@ -1390,12 +1523,15 @@ typedef struct {
     uint64_t mask;
 } MTRRVar;
 
+#define CPU_NB_EREGS64 32
 #define CPU_NB_REGS64 16
 #define CPU_NB_REGS32 8
 
 #ifdef TARGET_X86_64
+#define CPU_NB_EREGS CPU_NB_EREGS64
 #define CPU_NB_REGS CPU_NB_REGS64
 #else
+#define CPU_NB_EREGS CPU_NB_REGS32
 #define CPU_NB_REGS CPU_NB_REGS32
 #endif
 
@@ -1490,6 +1626,8 @@ typedef struct {
 
 #define ARCH_LBR_NR_ENTRIES            32
 
+#define EGPR_NUM  16
+
 /* Ext. save area 19: Supervisor mode Arch LBR state */
 typedef struct XSavesArchLBR {
     uint64_t lbr_ctl;
@@ -1499,6 +1637,11 @@ typedef struct XSavesArchLBR {
     uint64_t ler_info;
     LBREntry lbr_records[ARCH_LBR_NR_ENTRIES];
 } XSavesArchLBR;
+
+/* Ext. save area 19: APX state */
+typedef struct XSaveAPX {
+    uint64_t egprs[EGPR_NUM];
+} XSaveAPX;
 
 QEMU_BUILD_BUG_ON(sizeof(XSaveAVX) != 0x100);
 QEMU_BUILD_BUG_ON(sizeof(XSaveBNDREG) != 0x40);
@@ -1510,6 +1653,7 @@ QEMU_BUILD_BUG_ON(sizeof(XSavePKRU) != 0x8);
 QEMU_BUILD_BUG_ON(sizeof(XSaveXTILECFG) != 0x40);
 QEMU_BUILD_BUG_ON(sizeof(XSaveXTILEDATA) != 0x2000);
 QEMU_BUILD_BUG_ON(sizeof(XSavesArchLBR) != 0x328);
+QEMU_BUILD_BUG_ON(sizeof(XSaveAPX) != 0x80);
 
 typedef struct ExtSaveArea {
     uint32_t feature, bits;
@@ -1517,7 +1661,7 @@ typedef struct ExtSaveArea {
     uint32_t ecx;
 } ExtSaveArea;
 
-#define XSAVE_STATE_AREA_COUNT (XSTATE_XTILE_DATA_BIT + 1)
+#define XSAVE_STATE_AREA_COUNT (XSTATE_APX_BIT + 1)
 
 extern ExtSaveArea x86_ext_save_areas[XSAVE_STATE_AREA_COUNT];
 
@@ -1575,6 +1719,13 @@ typedef struct CPUCacheInfo {
      * address bits.  CPUID[4].EDX[bit 2].
      */
     bool complex_indexing;
+
+    /*
+     * Cache Topology. The level that cache is shared in.
+     * Used to encode CPUID[4].EAX[bits 25:14] or
+     * CPUID[0x8000001D].EAX[bits 25:14].
+     */
+    CpuTopologyLevel share_level;
 } CPUCacheInfo;
 
 
@@ -1592,7 +1743,7 @@ typedef struct HVFX86LazyFlags {
 
 typedef struct CPUArchState {
     /* standard registers */
-    target_ulong regs[CPU_NB_REGS];
+    target_ulong regs[CPU_NB_EREGS];
     target_ulong eip;
     target_ulong eflags; /* eflags register. During CPU emulation, CC
                         flags and DF are set to zero because they are
@@ -1649,7 +1800,7 @@ typedef struct CPUArchState {
     float_status mmx_status; /* for 3DNow! float ops */
     float_status sse_status;
     uint32_t mxcsr;
-    ZMMReg xmm_regs[CPU_NB_REGS == 8 ? 8 : 32] QEMU_ALIGNED(16);
+    ZMMReg xmm_regs[CPU_NB_EREGS] QEMU_ALIGNED(16);
     ZMMReg xmm_t0 QEMU_ALIGNED(16);
     MMXReg mmx_t0;
 
@@ -1672,6 +1823,17 @@ typedef struct CPUArchState {
     target_ulong cstar;
     target_ulong fmask;
     target_ulong kernelgsbase;
+
+    /* FRED MSRs */
+    uint64_t fred_rsp0;
+    uint64_t fred_rsp1;
+    uint64_t fred_rsp2;
+    uint64_t fred_rsp3;
+    uint64_t fred_stklvls;
+    uint64_t fred_ssp1;
+    uint64_t fred_ssp2;
+    uint64_t fred_ssp3;
+    uint64_t fred_config;
 #endif
 
     uint64_t tsc_adjust;
@@ -1808,14 +1970,21 @@ typedef struct CPUArchState {
     uint32_t cpuid_vendor3;
     uint32_t cpuid_version;
     FeatureWordArray features;
+    /* AVX10 version */
+    uint8_t avx10_version;
+    /* AVX10 (CPUID 0x24) maximum supported sub-leaf. */
+    uint8_t avx10_max_subleaf;
     /* Features that were explicitly enabled/disabled */
     FeatureWordArray user_features;
     uint32_t cpuid_model[12];
-    /* Cache information for CPUID.  When legacy-cache=on, the cache data
+    /*
+     * Cache information for CPUID.  When legacy-cache=on, the cache data
      * on each CPUID leaf will be different, because we keep compatibility
      * with old QEMU versions.
      */
-    CPUCaches cache_info_cpuid2, cache_info_cpuid4, cache_info_amd;
+    CPUCaches cache_info;
+    bool enable_legacy_cpuid2_cache;
+    bool enable_legacy_vendor_cache;
 
     /* MTRRs */
     uint64_t mtrr_fixed[11];
@@ -1882,7 +2051,10 @@ typedef struct CPUArchState {
 
     TPRAccess tpr_access_type;
 
-    unsigned nr_dies;
+    X86CPUTopoInfo topo_info;
+
+    /* Bitmap of available CPU topology levels for this CPU. */
+    DECLARE_BITMAP(avail_cpu_topo, CPU_TOPOLOGY_LEVEL__MAX);
 } CPUX86State;
 
 struct kvm_msrs;
@@ -1901,7 +2073,6 @@ struct ArchCPU {
     CPUState parent_obj;
     /*< public >*/
 
-    CPUNegativeOffsetState neg;
     CPUX86State env;
     VMChangeStateEntry *vmsentry;
 
@@ -1987,18 +2158,42 @@ struct ArchCPU {
     bool enable_l3_cache;
 
     /* Compatibility bits for old machine types.
+     * If true present L1 cache as per-thread, not per-core.
+     */
+    bool l1_cache_per_core;
+
+    /* Compatibility bits for old machine types.
      * If true present the old cache topology information
      */
     bool legacy_cache;
 
+    /*
+     * Compatibility bits for old machine types.
+     * If true, use the same cache model in CPUID leaf 0x2
+     * and 0x4.
+     */
+    bool consistent_cache;
+
     /* Compatibility bits for old machine types: */
     bool enable_cpuid_0xb;
+
+    /* Force to enable cpuid 0x1f */
+    bool force_cpuid_0x1f;
 
     /* Enable auto level-increase for all CPUID leaves */
     bool full_cpuid_auto_level;
 
-    /* Only advertise CPUID leaves defined by the vendor */
+    /*
+     * Compatibility bits for old machine types (PC machine v6.0 and older).
+     * Only advertise CPUID leaves defined by the vendor.
+     */
     bool vendor_cpuid_only;
+
+    /*
+     * Compatibility bits for old machine types (PC machine v10.0 and older).
+     * Only advertise CPUID leaves defined by the vendor.
+     */
+    bool vendor_cpuid_only_v2;
 
     /* Enable auto level-increase for Intel Processor Trace leave */
     bool intel_pt_auto_level;
@@ -2040,6 +2235,7 @@ struct ArchCPU {
     int32_t node_id; /* NUMA node this CPU belongs to */
     int32_t socket_id;
     int32_t die_id;
+    int32_t module_id;
     int32_t core_id;
     int32_t thread_id;
 
@@ -2071,6 +2267,7 @@ void x86_cpu_dump_state(CPUState *cs, FILE *f, int flags);
 
 int x86_cpu_gdb_read_register(CPUState *cpu, GByteArray *buf, int reg);
 int x86_cpu_gdb_write_register(CPUState *cpu, uint8_t *buf, int reg);
+void x86_cpu_gdb_init(CPUState *cs);
 
 void x86_cpu_list(void);
 int cpu_x86_support_mca_broadcast(CPUX86State *env);
@@ -2172,6 +2369,8 @@ static inline void cpu_x86_load_seg_cache_sipi(X86CPU *cpu,
     cs->halted = 0;
 }
 
+uint64_t cpu_x86_get_msr_core_thread_count(X86CPU *cpu);
+
 int cpu_x86_get_descr_debug(CPUX86State *env, unsigned int selector,
                             target_ulong *base, unsigned int *limit,
                             unsigned int *flags);
@@ -2209,6 +2408,12 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
 void cpu_clear_apic_feature(CPUX86State *env);
 void host_cpuid(uint32_t function, uint32_t count,
                 uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx);
+
+static inline bool x86_has_cpuid_0x1f(X86CPU *cpu)
+{
+    return cpu->force_cpuid_0x1f ||
+           x86_has_extended_topo(cpu->env.avail_cpu_topo);
+}
 
 /* helper.c */
 void x86_cpu_set_a20(X86CPU *cpu, int a20_state);
@@ -2495,6 +2700,9 @@ static inline uint64_t cr4_reserved_bits(CPUX86State *env)
     }
     if (!(env->features[FEAT_7_1_EAX] & CPUID_7_1_EAX_LAM)) {
         reserved_bits |= CR4_LAM_SUP_MASK;
+    }
+    if (!(env->features[FEAT_7_1_EAX] & CPUID_7_1_EAX_FRED)) {
+        reserved_bits |= CR4_FRED_MASK;
     }
     return reserved_bits;
 }

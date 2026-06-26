@@ -10,6 +10,7 @@
 
 #include "syscall_defs.h"
 #include "target_syscall.h"
+#include "accel/tcg/vcpu-state.h"
 
 /*
  * This is the size of the host kernel's sigset_t, needed where we make
@@ -97,7 +98,7 @@ struct emulated_sigtable {
     target_siginfo_t info;
 };
 
-typedef struct TaskState {
+struct TaskState {
     pid_t ts_tid;     /* tid (or pid) of this task */
 #ifdef TARGET_ARM
 # ifdef TARGET_ABI32
@@ -114,6 +115,10 @@ typedef struct TaskState {
     struct target_vm86plus_struct vm86plus;
     uint32_t v86flags;
     uint32_t v86mask;
+#endif
+#if defined(TARGET_I386)
+    /* Last syscall number. */
+    target_ulong orig_ax;
 #endif
     abi_ulong child_tidptr;
 #ifdef TARGET_M68K
@@ -160,7 +165,7 @@ typedef struct TaskState {
 
     /* Start time of task after system boot in clock ticks */
     uint64_t start_boottime;
-} TaskState;
+};
 
 abi_long do_brk(abi_ulong new_brk);
 int do_guest_openat(CPUArchState *cpu_env, int dirfd, const char *pathname,
