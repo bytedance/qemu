@@ -451,8 +451,7 @@ void helper_rdmsr(CPUX86State *env)
         val = x86_cpu->ucode_rev;
         break;
     case MSR_CORE_THREAD_COUNT: {
-        CPUState *cs = CPU(x86_cpu);
-        val = (cs->nr_threads * cs->nr_cores) | (cs->nr_cores << 16);
+        val = cpu_x86_get_msr_core_thread_count(x86_cpu);
         break;
     }
     default:
